@@ -4,13 +4,33 @@
 const RESUME_KEY = 'oib-consent-resume';
 const MAX_AGE_MS = 15 * 60 * 1000;
 
-export const saveConsentResume = ({ deploymentType, osTypes, allowPrerelease, autoLoadStatus = false }) => {
+/**
+ * @param state.deploymentType        'new' | 'existing' | 'device' | …
+ * @param state.osTypes               OS buckets to reload
+ * @param state.allowPrerelease
+ * @param state.autoLoadStatus        reload assignment status on return
+ * @param state.policyTypesSelection  New Deployment: the policy-types step result
+ * @param state.enableGroups          turn assignment groups back on
+ * @param state.groupSettings         { target, include, exclude } to restore
+ */
+export const saveConsentResume = ({
+  deploymentType,
+  osTypes,
+  allowPrerelease,
+  autoLoadStatus = false,
+  policyTypesSelection = null,
+  enableGroups = false,
+  groupSettings = null,
+}) => {
   try {
     sessionStorage.setItem(RESUME_KEY, JSON.stringify({
       deploymentType,
       osTypes,
       allowPrerelease: !!allowPrerelease,
       autoLoadStatus,
+      policyTypesSelection,
+      enableGroups,
+      groupSettings,
       timestamp: Date.now(),
     }));
   } catch {

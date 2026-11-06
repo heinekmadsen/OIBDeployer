@@ -15,6 +15,7 @@ import OSSelectionWizard from './components/OSSelectionWizard';
 import ValidationDashboard from './components/ValidationDashboard';
 import DeviceValidationDashboard from './components/DeviceValidationDashboard';
 import { saveConsentResume, takeConsentResume } from './utils/consent-resume';
+import { loadGroupNaming, saveGroupNaming, validateGroupNaming, groupKindsFor } from './utils/assignment-groups';
 import { CONFIG } from './utils/config';
 import authService from './utils/auth';
 import graphAPI from './utils/graph-api';
@@ -115,10 +116,80 @@ function App() {
     setDeploymentType(resume.deploymentType);
     setSelectedOSTypes(resume.osTypes);
     setAutoLoadAssignmentStatus(!!resume.autoLoadStatus);
-    setWizardStep('comparison-dashboard');
+    if (resume.enableGroups) {
+      const saved = resume.groupSettings || {};
+      setGroupOptions(prev => ({
+        ...prev,
+        enabled: true,
+        ...(saved.target ? { target: saved.target } : {}),
+        ...(typeof saved.include === 'boolean' ? { include: saved.include } : {}),
+        ...(typeof saved.exclude === 'boolean' ? { exclude: saved.exclude } : {}),
+      }));
+    }
+    if (resume.deploymentType === 'new' && resume.policyTypesSelection) {
+      const selection = resume.policyTypesSelection;
+      setSelectedPolicyTypes(selection.policyTypes || []);
+      setTenantLicensing(selection.tenantLicensing ?? null);
+      setUsingDefenderAV(selection.usingDefenderAV ?? null);
+      setWizardStep('policy-selection');
+    } else {
+      setWizardStep('comparison-dashboard');
+    }
     loadPoliciesForSelectedOS(resume.osTypes, resume.allowPrerelease);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAuthenticated, isLoadingReleaseManifest, releasePlatforms]);
+
+  // Assignment made right after deployment: new include/exclude groups, or
+  // All devices / All users with an optional exclude group.
+  const [groupOptions, setGroupOptions] = useState(() => ({
+    enabled: false,
+    target: 'group',
+    include: true,
+    exclude: true,
+    naming: loadGroupNaming(),
+  }));
+  const [groupAccess, setGroupAccess] = useState(null);
+
+  const handleGroupOptionsChange = (next) => {
+    setGroupOptions(next);
+    saveGroupNaming(next.naming);
+  };
+
+  const handleRequestGroupManageConsent = async () => {
+    saveConsentResume({
+      deploymentType: deploymentType || 'existing',
+      osTypes: selectedOSTypes,
+      allowPrerelease,
+      autoLoadStatus: deploymentType === 'existing',
+      policyTypesSelection: deploymentType === 'new'
+        ? { policyTypes: selectedPolicyTypes, osTypes: selectedOSTypes, tenantLicensing, usingDefenderAV }
+        : null,
+      enableGroups: true,
+      groupSettings: { target: groupOptions.target, include: groupOptions.include, exclude: groupOptions.exclude },
+    });
+    try {
+      await authService.requestAdditionalScopes(CONFIG.msal.groupManageScopes);
+    } catch (error) {
+      setError('Could not start the consent flow: ' + error.message);
+    }
+  };
+
+  // Deploy is blocked while groups are on but can't be created, so policies
+  // never land half-configured.
+  const groupsBlockReason = (policies) => {
+    if (!groupOptions.enabled) return null;
+    const kinds = groupKindsFor(groupOptions);
+    // All devices / All users without an exclude group needs no group access.
+    if (kinds.length > 0 && groupAccess !== 'granted') {
+      return 'Grant the group permissions first, or turn off group creation.';
+    }
+    const errors = validateGroupNaming(
+      groupOptions.naming,
+      policies.map(p => p.actualDisplayName || p.name),
+      { include: kinds.includes('include'), exclude: kinds.includes('exclude'), target: groupOptions.target }
+    );
+    return errors[0] ?? null;
+  };
 
   const handleRequestGroupConsent = async () => {
     saveConsentResume({
@@ -155,7 +226,12 @@ function App() {
     try {
       setIsLoading(true);
       await authService.initialize();
-      
+
+      const redirectError = authService.takeRedirectError();
+      if (redirectError) {
+        setError(`Sign-in or permission request was not completed: ${redirectError.message}`);
+      }
+
       if (authService.isAuthenticated()) {
         const account = authService.getAccount();
         const tenantId = authService.getTenantId();
@@ -406,6 +482,13 @@ function App() {
       return;
     }
 
+    const blockReason = groupsBlockReason(policies);
+    if (blockReason) {
+      setError(`Assignment groups: ${blockReason}`);
+      return;
+    }
+    const groupsForThisRun = groupOptions.enabled ? { ...groupOptions } : null;
+
     try {
       setIsLoading(true);
       setError(null);
@@ -522,6 +605,25 @@ function App() {
         }
       );
       console.log('Deployment completed, results:', results);
+
+      if (groupsForThisRun) {
+        const deployed = results.filter(r => r.success && r.policyId);
+        for (let i = 0; i < deployed.length; i++) {
+          const result = deployed[i];
+          setDeploymentProgress(prev => ({
+            ...prev,
+            currentStep: 'assigning',
+            currentPolicy: `Assigning: ${result.policyName}`,
+            completed: i,
+            total: deployed.length
+          }));
+          result.groups = await graphAPI.ensureAssignmentGroupsForPolicy(
+            { id: result.policyId, endpoint: result.endpoint, displayName: result.policyName },
+            groupsForThisRun
+          );
+        }
+      }
+
       setDeploymentResults(results);
 
       // Reset deployment progress
@@ -900,6 +1002,11 @@ function App() {
             autoLoadAssignmentStatus={autoLoadAssignmentStatus}
             onAutoLoadConsumed={() => setAutoLoadAssignmentStatus(false)}
             onRequestGroupConsent={handleRequestGroupConsent}
+            groupOptions={deploymentType === 'existing' ? groupOptions : null}
+            onGroupOptionsChange={handleGroupOptionsChange}
+            onGroupAccessChange={setGroupAccess}
+            onRequestGroupManageConsent={handleRequestGroupManageConsent}
+            groupsBlockReason={groupsBlockReason}
           />
         )}
 
@@ -963,6 +1070,11 @@ function App() {
             onBack={handleWizardBack}
             onDeploy={handleDeployment}
             isLoading={isLoading}
+            groupOptions={groupOptions}
+            onGroupOptionsChange={handleGroupOptionsChange}
+            onGroupAccessChange={setGroupAccess}
+            onRequestGroupManageConsent={handleRequestGroupManageConsent}
+            groupsBlockReason={groupsBlockReason}
           />
         )}
 
@@ -1036,6 +1148,7 @@ function App() {
                   {deploymentProgress.currentStep === 'loading' && 'Loading policies...'}
                   {deploymentProgress.currentStep === 'preparing-variables' && 'Preparing tenant variables...'}
                   {deploymentProgress.currentStep === 'deploying' && 'Deploying policies...'}
+                  {deploymentProgress.currentStep === 'assigning' && 'Assigning the deployed policies...'}
                 </strong>
               </div>
               

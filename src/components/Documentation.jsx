@@ -93,6 +93,10 @@ const Documentation = ({ onBack }) => {
               To show group names in the Existing Deployment assignment overview, the app can also request <code>GroupMember.Read.All</code> (read-only,
               admin consent). Without it, assigned groups are shown by their ID.
             </p>
+            <p>
+              Creating assignment groups and migrating between policy versions requests <code>Group.ReadWrite.All</code>,
+              <code>Device.Read.All</code> and <code>User.ReadBasic.All</code> (admin consent) the first time you turn it on.
+            </p>
           </div>
 
           <div className="faq-item">
@@ -151,9 +155,43 @@ const Documentation = ({ onBack }) => {
           <div className="faq-item">
             <h3>Will it assign any policies deployed?</h3>
             <p>
-              OIB Deployer does not assign any policies after deployment. You will need to manually assign the policies as per OIB guidance
-              to appropriate groups in Intune.
+              Not by default. Next to the Deploy button you can turn on "Assign each deployed policy" and choose what to assign it to:
             </p>
+            <ul>
+              <li>
+                <strong>A new include group per policy:</strong> the app creates (or reuses, if one with the same name exists) an include and/or exclude
+                security group named <code>{'{prefix}{policy name} - Include{suffix}'}</code> (the labels, prefix and suffix are yours to choose) and assigns
+                them to the policy. The groups start empty, so the policy reaches no one until you add devices or users to the include group. This is the
+                way to pilot a policy first.
+              </li>
+              <li>
+                <strong>All devices</strong> or <strong>All users</strong>, optionally with an exclude group per policy. Microsoft recommends these built-in
+                groups over your own "everyone" groups when a policy should reach everyone, as they need no group processing. Put devices in the exclude
+                group of an All devices assignment and users in that of an All users assignment: Intune doesn't support excluding user groups from device
+                assignments, or the other way round.
+              </li>
+              <li>
+                <strong>All devices or All users by scope:</strong> OIB policies marked D (device) go to All devices and those marked U (user) to All users.
+              </li>
+            </ul>
+            <p>
+              App protection policies and Windows feature, quality and driver update profiles can&apos;t be assigned to All devices or All users and are left
+              unassigned with that option. Without any of these options, assign the policies yourself as per OIB guidance.
+            </p>
+          </div>
+
+          <div className="faq-item">
+            <h3>How do I move devices from an old OIB version to the new one?</h3>
+            <p>
+              When an older version of a policy is still deployed next to the new one, Existing Deployment shows a "Version Migrations" tab and a
+              "Migrate devices…" button on the policy. The dialog lets you pilot the new version on a few devices or users first, move them back if
+              needed, and finish when you're ready:
+            </p>
+            <ul>
+              <li>If the old version is assigned through its own group (e.g. <em>… v3.7 - Include</em>), members are moved from that group to the new version's include group.</li>
+              <li>If it is assigned to All devices, All users or groups shared with other policies, those are left untouched: moved members are added to the old version's exclude group and the new version's include group.</li>
+              <li>"Finish migration" moves everyone that's left (or gives the new version the old version's assignments) and removes all assignments from the old version. The old policy is not deleted.</li>
+            </ul>
           </div>
 
           <div className="faq-item">

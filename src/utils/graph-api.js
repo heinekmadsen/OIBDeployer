@@ -1,6 +1,15 @@
 import { CONFIG } from './config.js';
 import authService from './auth.js';
 import logger from './logger.js';
+import {
+    buildGroupName,
+    buildMailNickname,
+    builtInTarget,
+    groupTarget,
+    mergeAssignmentTargets,
+    normaliseDirectoryObject,
+    planPolicyAssignment
+} from './assignment-groups.js';
 
 class GraphAPI {
     constructor() {
@@ -367,14 +376,19 @@ class GraphAPI {
 
         for (const req of requests) {
             const items = rawResults.get(req.batchId) || [];
-            groupMap.get(req.groupId).items.push(...items);
+            // Remember which collection each policy came from — update and
+            // app protection groups merge several endpoints, and assignment
+            // calls need the exact one.
+            const collection = req.endpoint.split('?')[0];
+            groupMap.get(req.groupId).items.push(...items.map(item => ({ item, collection })));
         }
 
         const allPolicies = [];
         for (const [, group] of groupMap) {
-            for (const policy of group.items) {
+            for (const { item: policy, collection } of group.items) {
                 const normalised = group.normalise(policy);
                 normalised.oibId = this.extractOibId(policy);
+                normalised.endpoint = collection;
                 allPolicies.push(normalised);
             }
         }
@@ -1107,6 +1121,9 @@ class GraphAPI {
             return {
                 success: true,
                 policyId: result.id,
+                // Collection the policy was created in — used to assign it afterwards.
+                endpoint,
+                policyType: effectiveType,
                 policyName: transformedPolicy.displayName || transformedPolicy.name || fileName,
                 fileName: fileName,
                 message: `Successfully deployed: ${transformedPolicy.displayName || transformedPolicy.name || fileName}`,
@@ -1736,13 +1753,13 @@ class GraphAPI {
      * GroupMember.Read.All — throws ConsentRequiredError when not granted.
      * Deleted groups map to null.
      */
-    async getGroupNames(groupIds) {
+    async getGroupNames(groupIds, scopes = CONFIG.msal.groupScopes) {
         const ids = [...new Set(groupIds.map(id => id.toLowerCase()))];
         const names = new Map();
         for (let i = 0; i < ids.length; i += 20) {
             const chunk = ids.slice(i, i + 20);
             const response = await this.makeScopedRequest(
-                CONFIG.msal.groupScopes,
+                scopes,
                 'https://graph.microsoft.com/v1.0/$batch',
                 'POST',
                 { requests: chunk.map(id => ({ id, method: 'GET', url: `/groups/${id}?$select=id,displayName` })) }
@@ -1872,6 +1889,230 @@ class GraphAPI {
             { maxRows }
         );
         return { ...result, source: 'configurationReport' };
+    }
+
+    // ── Assignment groups ───────────────────────────────────────────────────
+    // Creating groups and changing membership needs CONFIG.msal.groupManageScopes
+    // (requested incrementally). Policy assignments themselves only need the
+    // base DeviceManagementConfiguration scope.
+
+    // Throws ConsentRequiredError when the group permissions aren't granted.
+    async checkGroupManageAccess() {
+        await authService.getAccessTokenForScopes(CONFIG.msal.groupManageScopes);
+        return true;
+    }
+
+    async makeGroupRequest(endpoint, method = 'GET', body = null) {
+        const url = endpoint.startsWith('https://') ? endpoint : `${this.config.v1Url}${endpoint}`;
+        return this.makeScopedRequest(CONFIG.msal.groupManageScopes, url, method, body);
+    }
+
+    // v1.0 $batch with the group scopes, 20 requests per call.
+    // Returns Map<request id, { status, body }>.
+    async groupBatch(requests) {
+        const responses = new Map();
+        for (let i = 0; i < requests.length; i += 20) {
+            const chunk = requests.slice(i, i + 20).map(request => (
+                request.body ? { ...request, headers: { 'Content-Type': 'application/json' } } : request
+            ));
+            const result = await this.makeGroupRequest('/$batch', 'POST', { requests: chunk });
+            (result?.responses ?? []).forEach(response => responses.set(response.id, response));
+        }
+        return responses;
+    }
+
+    async findGroupsByName(displayName) {
+        const filter = encodeURIComponent(`displayName eq '${GraphAPI.escapeODataString(displayName)}'`);
+        const result = await this.makeGroupRequest(
+            `/groups?$filter=${filter}&$select=id,displayName,securityEnabled,groupTypes&$top=10`
+        );
+        return result?.value ?? [];
+    }
+
+    /**
+     * Reuse the security group with this exact name, or create an assigned
+     * (static) security group. Returns { id, displayName, created, dynamic, duplicates }.
+     */
+    async ensureGroup(displayName, description) {
+        const matches = await this.findGroupsByName(displayName);
+        const existing = matches.find(g => g.securityEnabled) || matches[0];
+        if (existing) {
+            return {
+                id: existing.id,
+                displayName: existing.displayName,
+                created: false,
+                dynamic: (existing.groupTypes || []).includes('DynamicMembership'),
+                duplicates: matches.length > 1 ? matches.length : 0
+            };
+        }
+
+        const group = await this.makeGroupRequest('/groups', 'POST', {
+            displayName,
+            description: description.slice(0, 1024),
+            mailEnabled: false,
+            securityEnabled: true,
+            mailNickname: buildMailNickname(displayName)
+        });
+        return { id: group.id, displayName: group.displayName, created: true, dynamic: false, duplicates: 0 };
+    }
+
+    // Collection a policy lives in, for /assignments and /assign.
+    static assignmentCollectionFor(policy) {
+        if (policy?.endpoint) return policy.endpoint;
+        return {
+            configurationPolicy: '/deviceManagement/configurationPolicies',
+            compliance: '/deviceManagement/deviceCompliancePolicies',
+            deviceConfiguration: '/deviceManagement/deviceConfigurations',
+            adminTemplate: '/deviceManagement/groupPolicyConfigurations',
+            endpointSecurity: '/deviceManagement/intents'
+        }[policy?.type] ?? null;
+    }
+
+    async getAssignmentsFor(policy) {
+        const collection = GraphAPI.assignmentCollectionFor(policy);
+        if (!collection) throw new Error(`Assignments not supported for policy type ${policy?.type}`);
+        const result = await this.makeScopedRequest(
+            CONFIG.msal.scopes,
+            `${collection}/${encodeURIComponent(policy.id)}/assignments`
+        );
+        return result?.value ?? [];
+    }
+
+    // /assign replaces the policy's entire assignment list.
+    async setAssignmentsFor(policy, assignments) {
+        const collection = GraphAPI.assignmentCollectionFor(policy);
+        if (!collection) throw new Error(`Assignments not supported for policy type ${policy?.type}`);
+        return this.makeScopedRequest(
+            CONFIG.msal.scopes,
+            `${collection}/${encodeURIComponent(policy.id)}/assign`,
+            'POST',
+            { assignments }
+        );
+    }
+
+    /**
+     * Add targets to a policy while keeping its existing assignments.
+     * A group created seconds ago may not have replicated to Intune yet, so
+     * failed assigns are retried a few times.
+     */
+    async addAssignmentTargets(policy, targets, { retries = 3, retryDelay = 4000 } = {}) {
+        const existing = await this.getAssignmentsFor(policy);
+        const { assignments, added } = mergeAssignmentTargets(existing, targets);
+        if (added === 0) return { added: 0 };
+
+        for (let attempt = 1; ; attempt++) {
+            try {
+                await this.setAssignmentsFor(policy, assignments);
+                return { added };
+            } catch (error) {
+                const retryable = error.status === 400 || error.status === 404;
+                if (!retryable || attempt >= retries) throw error;
+                logger.warn(`Assign failed (attempt ${attempt}), retrying — new groups may still be replicating:`, error.message);
+                await this.sleep(retryDelay);
+            }
+        }
+    }
+
+    /**
+     * Assign a freshly deployed (or existing) policy: to new include/exclude
+     * groups, or to All devices / All users plus an optional exclude group.
+     * Groups are created, or reused when one with the same name exists.
+     *
+     * @param policy  { id, endpoint?, type?, displayName }
+     * @param options { naming, target, include, exclude }
+     * @returns { builtIn, include?, exclude?, added, skipped?, error? }
+     */
+    async ensureAssignmentGroupsForPolicy(policy, options) {
+        const plan = planPolicyAssignment(policy, options);
+        const outcome = { added: 0, builtIn: plan.builtIn };
+        if (plan.skipped) {
+            outcome.skipped = plan.skipped;
+            return outcome;
+        }
+        try {
+            for (const kind of plan.groups) {
+                const name = buildGroupName(policy.displayName, kind, options.naming);
+                outcome[kind] = await this.ensureGroup(
+                    name,
+                    `${kind === 'include' ? 'Include' : 'Exclude'} group for the Intune policy "${policy.displayName}". Created by OIB Deployer.`
+                );
+            }
+            const targets = [
+                ...(plan.builtIn ? [builtInTarget(plan.builtIn)] : []),
+                ...plan.groups.map(kind => groupTarget(outcome[kind].id, kind)),
+            ];
+            // Retrying only helps while new groups replicate to Intune.
+            const { added } = await this.addAssignmentTargets(policy, targets, { retries: plan.groups.length > 0 ? 3 : 1 });
+            outcome.added = added;
+        } catch (error) {
+            outcome.error = error;
+        }
+        return outcome;
+    }
+
+    // ── Group membership (version migration) ────────────────────────────────
+
+    async getGroupMembers(groupId) {
+        const items = [];
+        let next = `/groups/${encodeURIComponent(groupId)}/members?$top=999`;
+        while (next) {
+            const page = await this.makeGroupRequest(next);
+            items.push(...(page?.value ?? []));
+            next = page?.['@odata.nextLink'] ?? null;
+        }
+        return items.map(normaliseDirectoryObject);
+    }
+
+    /**
+     * Add directory objects to a group. Already-present members count as
+     * success. Returns [{ id, ok, error? }].
+     */
+    async addGroupMembers(groupId, memberIds) {
+        const responses = await this.groupBatch(memberIds.map((id, i) => ({
+            id: String(i),
+            method: 'POST',
+            url: `/groups/${groupId}/members/$ref`,
+            body: { '@odata.id': `https://graph.microsoft.com/v1.0/directoryObjects/${id}` }
+        })));
+        return memberIds.map((id, i) => {
+            const response = responses.get(String(i));
+            const message = response?.body?.error?.message || '';
+            const ok = !!response && (response.status < 300 || (response.status === 400 && /already exist/i.test(message)));
+            return { id, ok, error: ok ? null : (message || `HTTP ${response?.status ?? 'no response'}`) };
+        });
+    }
+
+    // Remove directory objects from a group. Missing members count as success.
+    async removeGroupMembers(groupId, memberIds) {
+        const responses = await this.groupBatch(memberIds.map((id, i) => ({
+            id: String(i),
+            method: 'DELETE',
+            url: `/groups/${groupId}/members/${id}/$ref`
+        })));
+        return memberIds.map((id, i) => {
+            const response = responses.get(String(i));
+            const ok = !!response && (response.status < 300 || response.status === 404);
+            return { id, ok, error: ok ? null : (response?.body?.error?.message || `HTTP ${response?.status ?? 'no response'}`) };
+        });
+    }
+
+    // Search Entra devices and/or users by display name (and UPN for users).
+    async searchDirectory(query, types = ['device']) {
+        const q = encodeURIComponent(GraphAPI.escapeODataString(query.trim()));
+        if (!q) return [];
+        const requests = [];
+        if (types.includes('device')) {
+            requests.push(this.makeGroupRequest(
+                `/devices?$filter=startswith(displayName,'${q}')&$select=id,displayName,operatingSystem,operatingSystemVersion&$top=25`
+            ).then(r => (r?.value ?? []).map(d => normaliseDirectoryObject({ '@odata.type': '#microsoft.graph.device', ...d }))));
+        }
+        if (types.includes('user')) {
+            requests.push(this.makeGroupRequest(
+                `/users?$filter=startswith(displayName,'${q}') or startswith(userPrincipalName,'${q}')&$select=id,displayName,userPrincipalName&$top=25`
+            ).then(r => (r?.value ?? []).map(u => normaliseDirectoryObject({ '@odata.type': '#microsoft.graph.user', ...u }))));
+        }
+        const results = await Promise.all(requests);
+        return results.flat();
     }
 }
 

@@ -26,6 +26,7 @@ Before running the application, you must create an Entra ID App Registration:
    - **Microsoft Graph**: `DeviceManagementConfiguration.ReadWrite.All` (Delegated permission)
    - (Optional, for Device Validation) **Microsoft Graph**: `DeviceManagementManagedDevices.Read.All` (Delegated permission, requires admin consent). The app requests it incrementally the first time Device Validation is used.
    - (Optional, for group names in the Existing Deployment assignment overview) **Microsoft Graph**: `GroupMember.Read.All` (Delegated permission, requires admin consent). Without it, assigned groups are shown by ID.
+   - (Optional, for creating include/exclude assignment groups and migrating devices between policy versions) **Microsoft Graph**: `Group.ReadWrite.All`, `Device.Read.All` and `User.ReadBasic.All` (Delegated permissions, admin consent). Requested the first time the feature is turned on. Assigning deployed policies to All devices or All users without an exclude group doesn't need them.
    - (Optional) Grant admin consent for your organization
 7. Under **Authentication**, click **Add a platform** and select **Single-page application**, then add your redirect URI(s) there (this app uses the authorization code + PKCE flow via MSAL.js, not the legacy implicit grant — do not enable implicit grant tokens)
 

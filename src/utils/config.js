@@ -18,6 +18,16 @@ export const CONFIG = {
         groupScopes: [
             'https://graph.microsoft.com/DeviceManagementConfiguration.ReadWrite.All',
             'https://graph.microsoft.com/GroupMember.Read.All'
+        ],
+        // Requested incrementally for assignment groups: create include/exclude
+        // groups and move members between them during a version migration
+        // (Group.ReadWrite.All — Group.Create has no delegated form), and show
+        // member names (Device.Read.All, User.ReadBasic.All).
+        groupManageScopes: [
+            'https://graph.microsoft.com/DeviceManagementConfiguration.ReadWrite.All',
+            'https://graph.microsoft.com/Group.ReadWrite.All',
+            'https://graph.microsoft.com/Device.Read.All',
+            'https://graph.microsoft.com/User.ReadBasic.All'
         ]
     },
 

@@ -1,11 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { BarChart3, TrendingUp, AlertTriangle, CheckCircle, Plus, ArrowLeft, RefreshCw, Copy, Users, Loader, KeyRound } from 'lucide-react';
+import { BarChart3, TrendingUp, AlertTriangle, CheckCircle, Plus, ArrowLeft, RefreshCw, Copy, Users, Loader, KeyRound, GitMerge } from 'lucide-react';
 import graphAPI from '../utils/graph-api';
 import { summarizeAssignments } from '../utils/device-validation';
 import {
   getMatchedTenantPolicies, normalisePolicyStatusSummary, collectGroupIds, summariseAssignmentStatus
 } from '../utils/policy-status';
+import { getMigrationPairs } from '../utils/assignment-groups';
 import PolicyAssignmentStatus from './PolicyAssignmentStatus';
+import AssignmentGroupOptions from './AssignmentGroupOptions';
+import VersionMigrationModal from './VersionMigrationModal';
 
 const ComparisonDashboard = ({
   existingPolicies,
@@ -19,11 +22,21 @@ const ComparisonDashboard = ({
   showAssignmentStatus = false,
   autoLoadAssignmentStatus = false,
   onAutoLoadConsumed,
-  onRequestGroupConsent
+  onRequestGroupConsent,
+  groupOptions = null,
+  onGroupOptionsChange,
+  onGroupAccessChange,
+  onRequestGroupManageConsent,
+  groupsBlockReason
 }) => {
   const [comparisonData, setComparisonData] = useState(null);
   const [selectedForDeployment, setSelectedForDeployment] = useState([]);
   const [viewFilter, setViewFilter] = useState('all'); // 'all', 'new', 'outdated', 'missing'
+  const [migrationPair, setMigrationPair] = useState(null);
+
+  // Old OIB versions still deployed next to the current one (Existing Deployment only).
+  const migrationPairs = showAssignmentStatus && comparisonData ? getMigrationPairs(comparisonData) : [];
+  const pairFor = (policy) => migrationPairs.find(pair => pair.name === policy.name) || null;
 
   // Assignment & device-status overview (loaded on demand)
   const [assignmentsById, setAssignmentsById] = useState(null);
@@ -126,6 +139,8 @@ const ComparisonDashboard = ({
       case 'assigned':     return deployable(deployed.filter(isAssigned));
       case 'unassigned':   return deployable(deployed.filter(isUnassigned));
       case 'deviceIssues': return deployable(deployed.filter(hasDeviceIssues));
+      case 'migrations':
+        return forSelection ? [] : [...(osData.current || []), ...(osData.duplicates || [])].filter(p => pairFor(p));
       default:
         return forSelection
           ? [...(osData.missing || []), ...(osData.outdated || []), ...(osData.newer || [])]
@@ -605,6 +620,14 @@ const ComparisonDashboard = ({
             </>
           );
         })()}
+        {migrationPairs.length > 0 && (
+          <button
+            className={`filter-tab ${viewFilter === 'migrations' ? 'active' : ''}`}
+            onClick={() => setViewFilter('migrations')}
+          >
+            Version Migrations ({migrationPairs.length})
+          </button>
+        )}
       </div>
 
       {/* Assignment & device status overview */}
@@ -701,7 +724,7 @@ const ComparisonDashboard = ({
                       {viewFilter === 'newer' && <span className="os-stat-summary">{osData.totals.newer} policies</span>}
                       {viewFilter === 'current' && <span className="os-stat-summary">{osData.totals.current} policies</span>}
                       {viewFilter === 'duplicate' && <span className="os-stat-summary">{osData.totals.duplicates} policies</span>}
-                      {(viewFilter === 'assigned' || viewFilter === 'unassigned' || viewFilter === 'deviceIssues') && (
+                      {(viewFilter === 'assigned' || viewFilter === 'unassigned' || viewFilter === 'deviceIssues' || viewFilter === 'migrations') && (
                         <span className="os-stat-summary">{osPolicies.length} policies</span>
                       )}
                     </>
@@ -782,6 +805,11 @@ const ComparisonDashboard = ({
                                       {legacyPolicy.displayName || legacyPolicy.name}
                                     </span>
                                   ))}
+                                  {pairFor(policy) && (
+                                    <button className="btn btn-outline btn-small mig-open" onClick={() => setMigrationPair(pairFor(policy))}>
+                                      <GitMerge size={13} /> Migrate devices…
+                                    </button>
+                                  )}
                                 </div>
                               )}
                               {policy.status === 'duplicate' && (
@@ -795,6 +823,11 @@ const ComparisonDashboard = ({
                                       </li>
                                     ))}
                                   </ul>
+                                  {pairFor(policy) && (
+                                    <button className="btn btn-outline btn-small mig-open" onClick={() => setMigrationPair(pairFor(policy))}>
+                                      <GitMerge size={13} /> Migrate devices to {pairFor(policy).current.displayName || pairFor(policy).current.name}…
+                                    </button>
+                                  )}
                                 </div>
                               )}
                               <div className="policy-status">
@@ -851,24 +884,53 @@ const ComparisonDashboard = ({
 
       {/* Sticky Navigation */}
       <div className="comparison-navigation-sticky">
+        {groupOptions && selectedForDeployment.length > 0 && (
+          <AssignmentGroupOptions
+            options={groupOptions}
+            onChange={onGroupOptionsChange}
+            policyNames={selectedForDeployment.map(p => p.name)}
+            onAccessChange={onGroupAccessChange}
+            onGrantAccess={onRequestGroupManageConsent}
+          />
+        )}
         <div className="wizard-navigation">
           <button className="btn-secondary" onClick={onBack}>
             <ArrowLeft size={16} />
             Back
           </button>
-          
+
           <button className="btn-secondary btn-refresh" onClick={onRefresh} disabled={isLoading}>
             <RefreshCw size={16} className={isLoading ? 'spinning' : ''} />
             Refresh Data
           </button>
 
-          {selectedForDeployment.length > 0 && (
-            <button className="btn-primary" onClick={handleDeploySelected}>
-              Deploy Selected ({selectedForDeployment.length})
-            </button>
-          )}
+          {selectedForDeployment.length > 0 && (() => {
+            const blockReason = groupsBlockReason?.(selectedForDeployment);
+            return (
+              <button
+                className="btn-primary"
+                onClick={handleDeploySelected}
+                disabled={!!blockReason}
+                title={blockReason || undefined}
+              >
+                Deploy Selected ({selectedForDeployment.length})
+              </button>
+            );
+          })()}
         </div>
       </div>
+
+      {migrationPair && (
+        <VersionMigrationModal
+          pair={migrationPair}
+          naming={groupOptions?.naming}
+          onGrantAccess={onRequestGroupManageConsent}
+          onClose={(changed) => {
+            setMigrationPair(null);
+            if (changed && statusById) loadAssignmentStatus();
+          }}
+        />
+      )}
     </div>
   );
 };

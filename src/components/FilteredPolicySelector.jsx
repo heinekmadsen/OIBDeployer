@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { Search, CheckCircle, HelpCircle, Package, Filter, ArrowLeft, Upload, Plus, BarChart3 } from 'lucide-react';
+import AssignmentGroupOptions from './AssignmentGroupOptions';
 
-const FilteredPolicySelector = ({ 
-  existingPolicies, 
-  onPolicySelection, 
+const FilteredPolicySelector = ({
+  existingPolicies,
+  onPolicySelection,
   availablePolicies,
   selectedPolicyTypes,
   selectedOSTypes,
@@ -12,7 +13,12 @@ const FilteredPolicySelector = ({
   usingDefenderAV,
   onBack,
   onDeploy,
-  isLoading = false
+  isLoading = false,
+  groupOptions = null,
+  onGroupOptionsChange,
+  onGroupAccessChange,
+  onRequestGroupManageConsent,
+  groupsBlockReason
 }) => {
   const [selectedPolicies, setSelectedPolicies] = useState([]);
   const [searchFilter, setSearchFilter] = useState('');
@@ -488,22 +494,35 @@ const FilteredPolicySelector = ({
 
       {/* Sticky Navigation */}
       <div className="comparison-navigation-sticky">
+        {groupOptions && selectedPolicies.length > 0 && (
+          <AssignmentGroupOptions
+            options={groupOptions}
+            onChange={onGroupOptionsChange}
+            policyNames={selectedPolicies.map(p => p.actualDisplayName || p.name)}
+            onAccessChange={onGroupAccessChange}
+            onGrantAccess={onRequestGroupManageConsent}
+          />
+        )}
         <div className="wizard-navigation">
           <button className="btn-secondary" onClick={onBack}>
             <ArrowLeft size={16} />
             Back
           </button>
 
-          {selectedPolicies.length > 0 && (
-            <button
-              className="btn-primary"
-              onClick={() => onDeploy(selectedPolicies)}
-              disabled={isLoading}
-            >
-              Deploy Selected Policies ({selectedPolicies.length})
-              <Upload size={16} />
-            </button>
-          )}
+          {selectedPolicies.length > 0 && (() => {
+            const blockReason = groupsBlockReason?.(selectedPolicies);
+            return (
+              <button
+                className="btn-primary"
+                onClick={() => onDeploy(selectedPolicies)}
+                disabled={isLoading || !!blockReason}
+                title={blockReason || undefined}
+              >
+                Deploy Selected Policies ({selectedPolicies.length})
+                <Upload size={16} />
+              </button>
+            );
+          })()}
         </div>
       </div>
     </div>

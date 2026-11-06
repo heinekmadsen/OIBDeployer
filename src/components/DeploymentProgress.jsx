@@ -1,5 +1,59 @@
 import React from 'react';
-import { CheckCircle, XCircle, Clock, Loader, RotateCcw, ArrowLeft } from 'lucide-react';
+import { CheckCircle, XCircle, Clock, Loader, RotateCcw, ArrowLeft, Users, Ban, AlertTriangle, Globe } from 'lucide-react';
+import { builtInLabel } from '../utils/assignment-groups';
+
+const outcomeMessage = (groups) => {
+  if (groups.added === 0) return 'The policy already had this assignment.';
+  if (!groups.builtIn) return 'Groups assigned to the policy.';
+  return `Assigned to ${builtInLabel(groups.builtIn)}${groups.exclude ? ', with the exclude group' : ''}.`;
+};
+
+// Outcome of ensureAssignmentGroupsForPolicy for one deployed policy.
+const GroupOutcome = ({ groups }) => {
+  if (groups.skipped) {
+    return (
+      <div className="deployment-groups">
+        <div className="deployment-message warning">
+          <AlertTriangle size={13} /> {groups.skipped}
+        </div>
+      </div>
+    );
+  }
+  // Neutral chips: here the outcome matters, not include vs exclude, and red
+  // would read as a failure.
+  const chip = (kind, group) => group && (
+    <span key={kind} className="pas-chip" title={group.id}>
+      {kind === 'exclude' ? <Ban size={12} /> : <Users size={12} />}
+      <span className="pas-muted">{kind === 'exclude' ? 'Exclude:' : 'Include:'}</span>
+      {group.displayName}
+      <span className={group.created ? 'group-created' : 'pas-muted'}>
+        · {group.created ? 'created' : 'existing group'}{group.dynamic ? ', dynamic' : ''}
+      </span>
+    </span>
+  );
+  return (
+    <div className="deployment-groups">
+      <div className="pas-chips">
+        {groups.builtIn && (
+          <span className="pas-chip">
+            <Globe size={12} />
+            <span className="pas-muted">Include:</span>
+            {builtInLabel(groups.builtIn)}
+          </span>
+        )}
+        {chip('include', groups.include)}
+        {chip('exclude', groups.exclude)}
+      </div>
+      {groups.error ? (
+        <div className="deployment-message error">
+          <AlertTriangle size={13} /> Assignment not fully set up: {String(groups.error.message || groups.error).slice(0, 300)}
+        </div>
+      ) : (
+        <div className="deployment-message success">{outcomeMessage(groups)}</div>
+      )}
+    </div>
+  );
+};
 
 const DeploymentProgress = ({ 
   selectedPolicies, 
@@ -121,6 +175,7 @@ const DeploymentProgress = ({
                     {result.message}
                   </div>
                 )}
+                {result?.groups && <GroupOutcome groups={result.groups} />}
                 
                 {isPending && (
                   <div className="deployment-message pending">

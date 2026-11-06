@@ -46,7 +46,11 @@ class AuthService {
                 response = await this.msalInstance.handleRedirectPromise();
             } catch (redirectError) {
                 if (redirectError?.errorCode !== 'no_token_request_cache_error') {
-                    throw redirectError;
+                    // A failed or declined redirect (e.g. an incremental consent
+                    // the admin cancelled) must not block the app: keep the
+                    // cached sign-in and let the UI report what went wrong.
+                    console.error('Redirect sign-in or consent did not complete:', redirectError);
+                    this.lastRedirectError = redirectError;
                 }
             }
 
@@ -159,6 +163,18 @@ class AuthService {
             scopes,
             account: this.account
         });
+    }
+
+    // Error from the last redirect (sign-in or consent), read once.
+    takeRedirectError() {
+        const error = this.lastRedirectError || null;
+        this.lastRedirectError = null;
+        if (!error) return null;
+        // AADSTS messages carry trace/correlation IDs after the first sentence.
+        const message = String(error.errorMessage || error.message || error)
+            .replace(/\s*Trace ID:[\s\S]*$/, '')
+            .trim();
+        return { code: error.errorCode || null, message };
     }
 
     isAuthenticated() {
