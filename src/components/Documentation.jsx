@@ -46,7 +46,7 @@ const Documentation = ({ onBack }) => {
               <div className="step-content">
                 <h3>Deploy, Compare, or Validate</h3>
                 <p><strong>New:</strong> Answer a couple of quick questions about your tenant's licensing and Windows Update strategy (so irrelevant policies can be filtered out), then select and deploy the policies you want.</p>
-                <p><strong>Existing:</strong> Compare your tenant against the latest OIB version, then deploy any missing or outdated policies.</p>
+                <p><strong>Existing:</strong> Compare your tenant against the latest OIB version, then deploy any missing or outdated policies. Use "Load assignments &amp; device status" to see who each deployed policy is assigned to and how many devices report success, errors or conflicts.</p>
                 <p><strong>Validation:</strong> Review a per-setting drift report for each matched policy against the OIB baseline.</p>
                 <p><strong>Device Validation:</strong> Search for a device and see, per OIB policy, whether it applied, errored, conflicted, is pending, or isn't assigned to that device.</p>
               </div>
@@ -89,6 +89,10 @@ const Documentation = ({ onBack }) => {
               Device Validation additionally requests <code>DeviceManagementManagedDevices.Read.All</code> (read-only) the first time you use it.
               This permission requires admin consent, so you may need an administrator to approve it for the app registration.
             </p>
+            <p>
+              To show group names in the Existing Deployment assignment overview, the app can also request <code>GroupMember.Read.All</code> (read-only,
+              admin consent). Without it, assigned groups are shown by their ID.
+            </p>
           </div>
 
           <div className="faq-item">
@@ -120,6 +124,16 @@ const Documentation = ({ onBack }) => {
               Policy Validation is a read-only flow that compares each matched policy's individual settings against the OIB baseline, highlighting any drift: 
               mismatched values, settings present in the baseline but missing from the tenant, or extra settings present in the tenant but not the baseline. 
               It currently supports Settings Catalog, Endpoint Security, and Compliance policies. No changes are ever made to your tenant during validation.
+            </p>
+          </div>
+
+          <div className="faq-item">
+            <h3>Can I see who an OIB policy is assigned to and whether it works?</h3>
+            <p>
+              Yes. In Existing Deployment, click "Load assignments &amp; device status". Each deployed OIB policy then shows its assignment targets
+              (All devices, All users, included/excluded groups and assignment filters) and the number of devices reporting succeeded, error, conflict,
+              not compliant, pending or not applicable, with a per-device list on demand. Use the "Assigned", "Not Assigned" and "Device Errors" tabs to filter the list.
+              Device counts are devices that have reported on the policy, as on the policy's overview page in Intune, not the size of the assigned groups.
             </p>
           </div>
 

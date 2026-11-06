@@ -1,19 +1,38 @@
 import React, { useState, useEffect } from 'react';
-import { BarChart3, TrendingUp, AlertTriangle, CheckCircle, Plus, ArrowLeft, RefreshCw, Copy } from 'lucide-react';
+import { BarChart3, TrendingUp, AlertTriangle, CheckCircle, Plus, ArrowLeft, RefreshCw, Copy, Users, Loader, KeyRound } from 'lucide-react';
+import graphAPI from '../utils/graph-api';
+import { summarizeAssignments } from '../utils/device-validation';
+import {
+  getMatchedTenantPolicies, normalisePolicyStatusSummary, collectGroupIds, summariseAssignmentStatus
+} from '../utils/policy-status';
+import PolicyAssignmentStatus from './PolicyAssignmentStatus';
 
-const ComparisonDashboard = ({ 
-  existingPolicies, 
-  availablePolicies, 
-  onSelectPolicies, 
+const ComparisonDashboard = ({
+  existingPolicies,
+  availablePolicies,
+  onSelectPolicies,
   onBack,
   onRefresh,
   onComparisonReady,
   isLoading,
-  selectedVersion 
+  selectedVersion,
+  showAssignmentStatus = false,
+  autoLoadAssignmentStatus = false,
+  onAutoLoadConsumed,
+  onRequestGroupConsent
 }) => {
   const [comparisonData, setComparisonData] = useState(null);
   const [selectedForDeployment, setSelectedForDeployment] = useState([]);
   const [viewFilter, setViewFilter] = useState('all'); // 'all', 'new', 'outdated', 'missing'
+
+  // Assignment & device-status overview (loaded on demand)
+  const [assignmentsById, setAssignmentsById] = useState(null);
+  const [statusById, setStatusById] = useState(null);
+  const [groupNames, setGroupNames] = useState(null);
+  const [groupNamesIssue, setGroupNamesIssue] = useState(null); // 'consent' | error message
+  const [assignmentFilters, setAssignmentFilters] = useState(null);
+  const [isLoadingStatus, setIsLoadingStatus] = useState(false);
+  const [statusError, setStatusError] = useState(null);
 
   useEffect(() => {
     if (availablePolicies && Object.keys(availablePolicies).length > 0) {
@@ -22,6 +41,103 @@ const ComparisonDashboard = ({
       setComparisonData(null);
     }
   }, [availablePolicies, existingPolicies]);
+
+  const loadAssignmentStatus = async (data = comparisonData) => {
+    const tenantPolicies = getMatchedTenantPolicies(data);
+    if (tenantPolicies.length === 0) return;
+
+    setIsLoadingStatus(true);
+    setStatusError(null);
+    try {
+      const [rawAssignments, rawStatus, filters] = await Promise.all([
+        graphAPI.getAssignmentsForPolicies(tenantPolicies),
+        graphAPI.getPolicyStatusSummaries(tenantPolicies),
+        graphAPI.getAssignmentFilters().catch(() => null)
+      ]);
+
+      const assignments = new Map();
+      rawAssignments.forEach((value, id) => {
+        assignments.set(id, Array.isArray(value) ? summarizeAssignments(value) : value);
+      });
+      const statuses = new Map();
+      tenantPolicies.forEach(policy => {
+        statuses.set(policy.id, normalisePolicyStatusSummary(rawStatus.get(policy.id)));
+      });
+
+      setAssignmentsById(assignments);
+      setStatusById(statuses);
+      setAssignmentFilters(filters);
+
+      // Group names need an extra permission; degrade to IDs without it.
+      const groupIds = collectGroupIds([...assignments.values()]);
+      if (groupIds.length > 0) {
+        try {
+          setGroupNames(await graphAPI.getGroupNames(groupIds));
+          setGroupNamesIssue(null);
+        } catch (error) {
+          setGroupNames(null);
+          setGroupNamesIssue(error?.name === 'ConsentRequiredError' ? 'consent' : error.message);
+        }
+      }
+    } catch (error) {
+      setStatusError(error?.name === 'ConsentRequiredError'
+        ? 'Sign-in needs to be refreshed — sign out and in again.'
+        : error.message);
+    } finally {
+      setIsLoadingStatus(false);
+    }
+  };
+
+  // Returning from the group-names consent redirect: load straight away.
+  useEffect(() => {
+    if (autoLoadAssignmentStatus && showAssignmentStatus && comparisonData && !isLoadingStatus && !statusById) {
+      onAutoLoadConsumed?.();
+      loadAssignmentStatus(comparisonData);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoLoadAssignmentStatus, showAssignmentStatus, comparisonData]);
+
+  const isUnassigned = (policy) => {
+    const assignment = policy.existingPolicy && assignmentsById?.get(policy.existingPolicy.id);
+    return !!assignment && !assignment.error && !assignment.hasIncludes;
+  };
+
+  const isAssigned = (policy) => {
+    const assignment = policy.existingPolicy && assignmentsById?.get(policy.existingPolicy.id);
+    return !!assignment && !assignment.error && assignment.hasIncludes;
+  };
+
+  const hasDeviceIssues = (policy) => {
+    const status = policy.existingPolicy && statusById?.get(policy.existingPolicy.id);
+    return !!status && !status.loadError && status.issues > 0;
+  };
+
+  // Policies of one OS shown for a filter. With forSelection, only entries
+  // that can be ticked for deployment (missing / outdated / newer).
+  const policiesForFilter = (osData, filter, { forSelection = false } = {}) => {
+    const deployed = [...(osData.current || []), ...(osData.outdated || []), ...(osData.newer || [])];
+    const deployable = (list) => forSelection ? list.filter(p => p.status !== 'current') : list;
+    switch (filter) {
+      case 'new':          return osData.missing || [];
+      case 'outdated':     return osData.outdated || [];
+      case 'newer':        return osData.newer || [];
+      case 'current':      return osData.current || [];
+      case 'duplicate':    return forSelection ? [] : (osData.duplicates || []);
+      case 'assigned':     return deployable(deployed.filter(isAssigned));
+      case 'unassigned':   return deployable(deployed.filter(isUnassigned));
+      case 'deviceIssues': return deployable(deployed.filter(hasDeviceIssues));
+      default:
+        return forSelection
+          ? [...(osData.missing || []), ...(osData.outdated || []), ...(osData.newer || [])]
+          : [
+              ...(osData.missing || []),
+              ...(osData.outdated || []),
+              ...(osData.newer || []),
+              ...(osData.current || []),
+              ...(osData.duplicates || [])
+            ];
+    }
+  };
 
   const generateComparisonData = () => {
     const comparison = {
@@ -312,24 +428,8 @@ const ComparisonDashboard = ({
   const handleGlobalSelectAll = () => {
     // Get all currently filtered policies across all OS types
     const allFilteredPolicies = [];
-    Object.entries(comparisonData.byOS).forEach(([osType, osData]) => {
-      const getOSFilteredPolicies = () => {
-        switch (viewFilter) {
-          case 'new':
-            return osData.missing || [];
-          case 'outdated':
-            return osData.outdated || [];
-          case 'newer':
-            return osData.newer || [];
-          case 'current':
-            return osData.current || [];
-          case 'duplicate':
-            return [];
-          default:
-            return [...(osData.missing || []), ...(osData.outdated || []), ...(osData.newer || [])];
-        }
-      };
-      allFilteredPolicies.push(...getOSFilteredPolicies());
+    Object.values(comparisonData.byOS).forEach(osData => {
+      allFilteredPolicies.push(...policiesForFilter(osData, viewFilter, { forSelection: true }));
     });
 
     // Check if all filtered policies are selected
@@ -479,7 +579,78 @@ const ComparisonDashboard = ({
             Duplicate Matches ({comparisonData.totals.duplicates})
           </button>
         )}
+        {statusById && (() => {
+          const count = (filter) => Object.values(comparisonData.byOS)
+            .reduce((sum, osData) => sum + policiesForFilter(osData, filter).length, 0);
+          return (
+            <>
+              <button
+                className={`filter-tab ${viewFilter === 'assigned' ? 'active' : ''}`}
+                onClick={() => setViewFilter('assigned')}
+              >
+                Assigned ({count('assigned')})
+              </button>
+              <button
+                className={`filter-tab ${viewFilter === 'unassigned' ? 'active' : ''}`}
+                onClick={() => setViewFilter('unassigned')}
+              >
+                Not Assigned ({count('unassigned')})
+              </button>
+              <button
+                className={`filter-tab ${viewFilter === 'deviceIssues' ? 'active' : ''}`}
+                onClick={() => setViewFilter('deviceIssues')}
+              >
+                Device Errors ({count('deviceIssues')})
+              </button>
+            </>
+          );
+        })()}
       </div>
+
+      {/* Assignment & device status overview */}
+      {showAssignmentStatus && (
+        <div className="assignment-status-bar">
+          <div className="assignment-status-main">
+            <Users size={18} />
+            {statusById ? (() => {
+              const summary = summariseAssignmentStatus(getMatchedTenantPolicies(comparisonData), assignmentsById, statusById);
+              return (
+                <span>
+                  {`${summary.assigned} of ${summary.total} deployed OIB policies are assigned`}
+                  {summary.unassigned > 0 && <> · <b>{summary.unassigned} not assigned</b></>}
+                  {summary.withIssues > 0 && <> · <b>{summary.withIssues} with device errors or conflicts</b></>}
+                </span>
+              );
+            })() : (
+              <span>See who each deployed OIB policy is assigned to, and how many devices report success, errors or conflicts.</span>
+            )}
+            <button
+              className="btn btn-secondary btn-small"
+              onClick={() => loadAssignmentStatus()}
+              disabled={isLoadingStatus || getMatchedTenantPolicies(comparisonData).length === 0}
+            >
+              {isLoadingStatus
+                ? <><Loader size={14} className="spinning" /> Loading…</>
+                : statusById ? <><RefreshCw size={14} /> Refresh status</> : 'Load assignments & device status'}
+            </button>
+          </div>
+          {statusError && (
+            <div className="assignment-status-note"><AlertTriangle size={14} /> {statusError}</div>
+          )}
+          {groupNamesIssue === 'consent' && (
+            <div className="assignment-status-note">
+              <KeyRound size={14} />
+              <span>Group names need the read-only <code>GroupMember.Read.All</code> permission (admin consent). Showing group IDs until then.</span>
+              {onRequestGroupConsent && (
+                <button className="btn btn-outline btn-small" onClick={onRequestGroupConsent}>Grant access</button>
+              )}
+            </div>
+          )}
+          {groupNamesIssue && groupNamesIssue !== 'consent' && (
+            <div className="assignment-status-note"><AlertTriangle size={14} /> Couldn't read group names: {groupNamesIssue.slice(0, 160)}</div>
+          )}
+        </div>
+      )}
 
       {/* Global Selection Controls */}
       <div className="global-controls">
@@ -490,26 +661,10 @@ const ComparisonDashboard = ({
           {(() => {
             // Get all currently filtered policies
             const allFilteredPolicies = [];
-            Object.entries(comparisonData.byOS).forEach(([osType, osData]) => {
-              const getOSFilteredPolicies = () => {
-                switch (viewFilter) {
-                  case 'new':
-                    return osData.missing || [];
-                  case 'outdated':
-                    return osData.outdated || [];
-                  case 'newer':
-                    return osData.newer || [];
-                  case 'current':
-                    return osData.current || [];
-                  case 'duplicate':
-                    return [];
-                  default:
-                    return [...(osData.missing || []), ...(osData.outdated || []), ...(osData.newer || [])];
-                }
-              };
-              allFilteredPolicies.push(...getOSFilteredPolicies());
+            Object.values(comparisonData.byOS).forEach(osData => {
+              allFilteredPolicies.push(...policiesForFilter(osData, viewFilter, { forSelection: true }));
             });
-            
+
             const areAllSelected = allFilteredPolicies.length > 0 && 
               allFilteredPolicies.every(policy => selectedForDeployment.some(p => p.name === policy.name));
             
@@ -525,30 +680,7 @@ const ComparisonDashboard = ({
       <div className="policy-comparison-list">
         {comparisonData.byOS && Object.entries(comparisonData.byOS).map(([osType, osData]) => {
           // Get filtered policies for this OS
-          const getOSFilteredPolicies = () => {
-            switch (viewFilter) {
-              case 'new':
-                return osData.missing || [];
-              case 'outdated':
-                return osData.outdated || [];
-              case 'newer':
-                return osData.newer || [];
-              case 'current':
-                return osData.current || [];
-              case 'duplicate':
-                return osData.duplicates || [];
-              default:
-                return [
-                  ...(osData.missing || []),
-                  ...(osData.outdated || []),
-                  ...(osData.newer || []),
-                  ...(osData.current || []),
-                  ...(osData.duplicates || [])
-                ];
-            }
-          };
-
-          const osPolicies = getOSFilteredPolicies();
+          const osPolicies = policiesForFilter(osData, viewFilter);
           
           if (osPolicies.length === 0) return null;
 
@@ -569,6 +701,9 @@ const ComparisonDashboard = ({
                       {viewFilter === 'newer' && <span className="os-stat-summary">{osData.totals.newer} policies</span>}
                       {viewFilter === 'current' && <span className="os-stat-summary">{osData.totals.current} policies</span>}
                       {viewFilter === 'duplicate' && <span className="os-stat-summary">{osData.totals.duplicates} policies</span>}
+                      {(viewFilter === 'assigned' || viewFilter === 'unassigned' || viewFilter === 'deviceIssues') && (
+                        <span className="os-stat-summary">{osPolicies.length} policies</span>
+                      )}
                     </>
                   )}
                 </div>
@@ -613,6 +748,15 @@ const ComparisonDashboard = ({
                                   <span className="matched-label">Matched Policy:</span>
                                   <span className="matched-name">{policy.existingPolicy.displayName || policy.existingPolicy.name}</span>
                                 </div>
+                              )}
+                              {showAssignmentStatus && policy.existingPolicy && statusById && (
+                                <PolicyAssignmentStatus
+                                  tenantPolicy={policy.existingPolicy}
+                                  assignment={assignmentsById?.get(policy.existingPolicy.id)}
+                                  status={statusById.get(policy.existingPolicy.id)}
+                                  groupNames={groupNames}
+                                  filters={assignmentFilters}
+                                />
                               )}
                               {policy.lifecycleStatus === 'deprecated' && (
                                 <div className="deprecation-notice">

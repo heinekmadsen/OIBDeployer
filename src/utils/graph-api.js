@@ -1407,7 +1407,13 @@ class GraphAPI {
     // bubbles up so the UI can offer a "grant access" step.
 
     async makeDeviceRequest(endpoint, method = 'GET', body = null) {
-        const token = await authService.getAccessTokenForScopes(CONFIG.msal.deviceScopes);
+        return this.makeScopedRequest(CONFIG.msal.deviceScopes, endpoint, method, body);
+    }
+
+    // Graph request with a silently-acquired token for specific scopes.
+    // Throws ConsentRequiredError instead of redirecting.
+    async makeScopedRequest(scopes, endpoint, method = 'GET', body = null) {
+        const token = await authService.getAccessTokenForScopes(scopes);
         const url = endpoint.startsWith('https://') ? endpoint : `${this.config.baseUrl}${endpoint}`;
         const options = {
             method,
@@ -1503,16 +1509,30 @@ class GraphAPI {
             'PspdpuLastModifiedTimeUtc', 'PolicyName', 'UnifiedPolicyType'
         ];
 
-        const PAGE_SIZE = 50;
+        const { rows } = await this.fetchReportRows(
+            CONFIG.msal.deviceScopes,
+            'getConfigurationPoliciesReportForDevice',
+            { select, filter, orderBy: ['PolicyName'] }
+        );
+        return rows;
+    }
+
+    /**
+     * Page through an Intune report action (POST /deviceManagement/reports/{action})
+     * and turn its Schema/Values arrays into row objects.
+     * Returns { rows, total, truncated }.
+     */
+    async fetchReportRows(scopes, action, body, { maxRows = 5000, pageSize = 50, paged = true } = {}) {
         const rows = [];
         let schema = null;
         let total = null;
 
-        for (let skip = 0; skip < 5000; skip += PAGE_SIZE) {
-            const page = await this.makeDeviceRequest(
-                '/deviceManagement/reports/getConfigurationPoliciesReportForDevice',
+        for (let skip = 0; skip < maxRows; skip += pageSize) {
+            const page = await this.makeScopedRequest(
+                scopes,
+                `/deviceManagement/reports/${action}`,
                 'POST',
-                { select, filter, skip, top: PAGE_SIZE, orderBy: ['PolicyName'] }
+                paged ? { ...body, skip, top: pageSize } : body
             );
 
             schema = schema || page?.Schema || page?.schema;
@@ -1526,10 +1546,10 @@ class GraphAPI {
                 rows.push(row);
             });
 
-            if (values.length < PAGE_SIZE || (total !== null && rows.length >= total)) break;
+            if (!paged || values.length < pageSize || (total !== null && rows.length >= total)) break;
         }
 
-        return rows;
+        return { rows, total: total ?? rows.length, truncated: total !== null && rows.length < total };
     }
 
     /**
@@ -1537,6 +1557,27 @@ class GraphAPI {
      * the configuration report, so they are read from the managed device.
      */
     async getDeviceCompliancePolicyStates(deviceId) {
+        // Preferred: the compliance report the portal uses. In testing,
+        // managedDevices/{id}/deviceCompliancePolicyStates lagged behind it
+        // and omitted policies the device had already evaluated.
+        try {
+            const { rows } = await this.fetchReportRows(
+                CONFIG.msal.deviceScopes,
+                'getDevicePoliciesComplianceReport',
+                { filter: `(DeviceId eq '${GraphAPI.escapeODataString(deviceId)}')`, select: [], orderBy: [] }
+            );
+            // Same shape as deviceCompliancePolicyState so callers don't care.
+            return rows.map(row => ({
+                id: row.PolicyId,
+                displayName: row.PolicyName,
+                state: String(row.PolicyStatus_loc ?? row.PolicyStatus ?? '').replace(/\s+/g, ''),
+                userPrincipalName: row.UPN || ''
+            }));
+        } catch (error) {
+            if (error?.name === 'ConsentRequiredError') throw error;
+            logger.warn('Compliance report failed, falling back to deviceCompliancePolicyStates:', error);
+        }
+
         const result = await this.makeDeviceRequest(
             `/deviceManagement/managedDevices/${encodeURIComponent(deviceId)}/deviceCompliancePolicyStates`
         );
@@ -1558,7 +1599,11 @@ class GraphAPI {
         const base = endpoints[tenantPolicy?.type];
         if (!base) throw new Error(`Assignments not supported for policy type ${tenantPolicy?.type}`);
 
-        const result = await this.makeDeviceRequest(`${base}/${encodeURIComponent(tenantPolicy.id)}/assignments`);
+        // Base scope is enough for assignments.
+        const result = await this.makeScopedRequest(
+            CONFIG.msal.scopes,
+            `${base}/${encodeURIComponent(tenantPolicy.id)}/assignments`
+        );
         return result?.value ?? [];
     }
 
@@ -1589,6 +1634,244 @@ class GraphAPI {
             },
             fetchedAt: new Date().toISOString()
         };
+    }
+
+    // ── Policy assignments & device status (Existing Deployment) ────────────
+    // Uses the base DeviceManagementConfiguration scope, except group names
+    // which need GroupMember.Read.All (requested incrementally).
+
+    // Follow @odata.nextLink for a GET collection with a scoped token.
+    async getAllPagesScoped(scopes, endpoint) {
+        const items = [];
+        let next = endpoint;
+        while (next) {
+            const page = await this.makeScopedRequest(scopes, next);
+            items.push(...(page?.value ?? []));
+            next = page?.['@odata.nextLink'] ?? null;
+        }
+        return items;
+    }
+
+    /**
+     * Assignments for every tenant policy of the given normalised types,
+     * fetched with $expand=assignments on the list endpoints (a handful of
+     * calls instead of one per policy). Intents don't support $expand, so
+     * those are fetched per policy.
+     *
+     * @param {object[]} tenantPolicies  normalised tenant policies
+     * @returns {Map<string, object[]|{error:string}>}  policy id → assignments
+     */
+    async getAssignmentsForPolicies(tenantPolicies) {
+        const scopes = CONFIG.msal.scopes;
+        const types = new Set(tenantPolicies.map(p => p.type));
+        const sources = [
+            { type: 'configurationPolicy', urls: ['/deviceManagement/configurationPolicies?$select=id&$expand=assignments&$top=100'] },
+            { type: 'compliance', urls: ['/deviceManagement/deviceCompliancePolicies?$select=id&$expand=assignments'] },
+            { type: 'deviceConfiguration', urls: ['/deviceManagement/deviceConfigurations?$select=id&$expand=assignments'] },
+            { type: 'adminTemplate', urls: ['/deviceManagement/groupPolicyConfigurations?$select=id&$expand=assignments'] },
+            { type: 'updatePolicy', urls: [
+                '/deviceManagement/windowsFeatureUpdateProfiles?$select=id&$expand=assignments',
+                '/deviceManagement/windowsQualityUpdateProfiles?$select=id&$expand=assignments',
+                '/deviceManagement/windowsDriverUpdateProfiles?$select=id&$expand=assignments'
+            ] },
+            { type: 'appProtection', urls: [
+                '/deviceAppManagement/iosManagedAppProtections?$select=id&$expand=assignments',
+                '/deviceAppManagement/androidManagedAppProtections?$select=id&$expand=assignments'
+            ] }
+        ].filter(source => types.has(source.type));
+
+        const byId = new Map();
+        const failedTypes = new Map();
+
+        await Promise.all(sources.flatMap(source => source.urls.map(async url => {
+            let items;
+            try {
+                items = await this.getAllPagesScoped(scopes, url);
+            } catch (error) {
+                if (error?.name === 'ConsentRequiredError') throw error;
+                // Some list endpoints reject $select together with $expand.
+                try {
+                    items = await this.getAllPagesScoped(scopes, url.replace('$select=id&', ''));
+                } catch (retryError) {
+                    if (retryError?.name === 'ConsentRequiredError') throw retryError;
+                    failedTypes.set(source.type, retryError.message);
+                    return;
+                }
+            }
+            items.forEach(item => byId.set(item.id.toLowerCase(), item.assignments ?? []));
+        })));
+
+        // Legacy Endpoint Security intents: per-policy fetch.
+        const intents = tenantPolicies.filter(p => p.type === 'endpointSecurity');
+        for (const intent of intents) {
+            try {
+                byId.set(intent.id.toLowerCase(), await this.getPolicyAssignments(intent));
+            } catch (error) {
+                if (error?.name === 'ConsentRequiredError') throw error;
+                byId.set(intent.id.toLowerCase(), { error: error.message });
+            }
+        }
+
+        const result = new Map();
+        tenantPolicies.forEach(policy => {
+            const key = policy.id.toLowerCase();
+            if (byId.has(key)) result.set(policy.id, byId.get(key));
+            else if (failedTypes.has(policy.type)) result.set(policy.id, { error: failedTypes.get(policy.type) });
+            else result.set(policy.id, { error: 'Policy not found when reading assignments' });
+        });
+        return result;
+    }
+
+    // Assignment filters (id → { displayName, platform }) for labelling.
+    async getAssignmentFilters() {
+        const items = await this.getAllPagesScoped(
+            CONFIG.msal.scopes,
+            '/deviceManagement/assignmentFilters?$select=id,displayName,platform'
+        );
+        return new Map(items.map(f => [f.id.toLowerCase(), f]));
+    }
+
+    /**
+     * Resolve Entra group IDs to display names via $batch. Requires
+     * GroupMember.Read.All — throws ConsentRequiredError when not granted.
+     * Deleted groups map to null.
+     */
+    async getGroupNames(groupIds) {
+        const ids = [...new Set(groupIds.map(id => id.toLowerCase()))];
+        const names = new Map();
+        for (let i = 0; i < ids.length; i += 20) {
+            const chunk = ids.slice(i, i + 20);
+            const response = await this.makeScopedRequest(
+                CONFIG.msal.groupScopes,
+                'https://graph.microsoft.com/v1.0/$batch',
+                'POST',
+                { requests: chunk.map(id => ({ id, method: 'GET', url: `/groups/${id}?$select=id,displayName` })) }
+            );
+            for (const item of response?.responses ?? []) {
+                if (item.status === 200) {
+                    names.set(item.id, item.body?.displayName ?? null);
+                } else if (item.status === 404) {
+                    names.set(item.id, null);
+                } else if (item.status === 403) {
+                    const error = new Error('Insufficient privileges to read group names');
+                    error.status = 403;
+                    throw error;
+                }
+            }
+        }
+        return names;
+    }
+
+    // Report base type per normalised tenant policy type.
+    static reportBaseTypeFor(type) {
+        return {
+            configurationPolicy: 'DeviceManagementConfigurationPolicy',
+            endpointSecurity: 'Microsoft.Management.Services.Api.DeviceManagementIntent',
+            deviceConfiguration: 'Microsoft.Management.Services.Api.DeviceConfiguration',
+            adminTemplate: 'DeviceConfigurationAdmxPolicy'
+        }[type] ?? null;
+    }
+
+    /**
+     * Device status counts per policy — the numbers shown on a policy's
+     * Overview page in Intune. Configuration-type policies use the summary
+     * report (batched by base type); compliance uses deviceStatusOverview.
+     *
+     * @returns {Map<string, object>}  policy id → raw summary ({ source, row|overview } or { error })
+     */
+    async getPolicyStatusSummaries(tenantPolicies) {
+        const scopes = CONFIG.msal.scopes;
+        const result = new Map();
+
+        // Configuration-type policies: one summary report call per base type per 20 IDs.
+        const byBaseType = new Map();
+        tenantPolicies.forEach(policy => {
+            const baseType = GraphAPI.reportBaseTypeFor(policy.type);
+            if (!baseType) return;
+            if (!byBaseType.has(baseType)) byBaseType.set(baseType, []);
+            byBaseType.get(baseType).push(policy);
+        });
+
+        for (const [baseType, policies] of byBaseType) {
+            for (let i = 0; i < policies.length; i += 20) {
+                const chunk = policies.slice(i, i + 20);
+                const ids = chunk.map(p => `(PolicyId eq '${GraphAPI.escapeODataString(p.id)}')`).join(' or ');
+                try {
+                    const { rows } = await this.fetchReportRows(
+                        scopes,
+                        'getConfigurationPolicyDeviceSummaryReport',
+                        { filter: `((PolicyBaseTypeName eq '${baseType}') and (${ids}))`, select: [] },
+                        { paged: false }
+                    );
+                    const rowById = new Map(rows.map(row => [(row.PolicyId || '').toLowerCase(), row]));
+                    chunk.forEach(policy => {
+                        const row = rowById.get(policy.id.toLowerCase());
+                        // No row = no device has reported on the policy yet.
+                        result.set(policy.id, { source: 'configurationReport', row: row ?? null });
+                    });
+                } catch (error) {
+                    if (error?.name === 'ConsentRequiredError') throw error;
+                    chunk.forEach(policy => result.set(policy.id, { error: error.message }));
+                }
+            }
+        }
+
+        // Compliance policies: per-policy overview, small concurrency.
+        const compliance = tenantPolicies.filter(p => p.type === 'compliance');
+        const queue = [...compliance];
+        const worker = async () => {
+            while (queue.length) {
+                const policy = queue.shift();
+                try {
+                    const overview = await this.makeScopedRequest(
+                        scopes,
+                        `/deviceManagement/deviceCompliancePolicies/${encodeURIComponent(policy.id)}/deviceStatusOverview`
+                    );
+                    result.set(policy.id, { source: 'complianceOverview', overview });
+                } catch (error) {
+                    if (error?.name === 'ConsentRequiredError') throw error;
+                    result.set(policy.id, { error: error.message });
+                }
+            }
+        };
+        await Promise.all(Array.from({ length: Math.min(4, queue.length) }, worker));
+
+        return result;
+    }
+
+    /**
+     * Per-device status rows for one policy (the policy's "Device and user
+     * check-in status" view). Returns { rows, total, truncated } with raw
+     * report rows; normalise with policy-status.js.
+     */
+    async getPolicyDeviceStatuses(tenantPolicy, maxRows = 500) {
+        const scopes = CONFIG.msal.scopes;
+        const id = GraphAPI.escapeODataString(tenantPolicy.id);
+
+        if (tenantPolicy.type === 'compliance') {
+            const result = await this.fetchReportRows(
+                scopes,
+                'getDeviceStatusByCompliacePolicyReport', // sic — Graph's spelling
+                { filter: `(PolicyId eq '${id}')`, select: [], orderBy: [] },
+                { maxRows }
+            );
+            return { ...result, source: 'complianceReport' };
+        }
+
+        const baseType = GraphAPI.reportBaseTypeFor(tenantPolicy.type);
+        if (!baseType) throw new Error(`No per-device report for policy type ${tenantPolicy.type}`);
+
+        const result = await this.fetchReportRows(
+            scopes,
+            'getConfigurationPolicyDevicesReport',
+            {
+                filter: `((PolicyBaseTypeName eq '${baseType}') and (PolicyId eq '${id}'))`,
+                select: ['DeviceName', 'UPN', 'PolicyStatus', 'IntuneDeviceId', 'PspdpuLastModifiedTimeUtc'],
+                orderBy: []
+            },
+            { maxRows }
+        );
+        return { ...result, source: 'configurationReport' };
     }
 }
 

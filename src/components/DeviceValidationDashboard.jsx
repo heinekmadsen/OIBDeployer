@@ -6,12 +6,12 @@ import {
 import graphAPI from '../utils/graph-api';
 import authService from '../utils/auth';
 import { CONFIG } from '../utils/config';
+import { saveConsentResume } from '../utils/consent-resume';
 import {
   DEVICE_STATUS, ISSUE_STATUSES, buildDeviceValidation, getOIBOSTypesForDevice,
   getPoliciesNeedingAssignments, summarizeAssignments
 } from '../utils/device-validation';
 
-export const DEVICE_RESUME_KEY = 'oib-device-validation-resume';
 
 const formatDate = (value) => {
   if (!value) return '—';
@@ -169,13 +169,7 @@ const DeviceValidationDashboard = ({
   };
 
   const handleGrantConsent = async () => {
-    try {
-      sessionStorage.setItem(DEVICE_RESUME_KEY, JSON.stringify({
-        osTypes: selectedOSTypes,
-        allowPrerelease,
-        timestamp: Date.now(),
-      }));
-    } catch { /* storage unavailable — the user just re-runs the wizard */ }
+    saveConsentResume({ deploymentType: 'device', osTypes: selectedOSTypes, allowPrerelease });
     try {
       await authService.requestAdditionalScopes(CONFIG.msal.deviceScopes);
     } catch (err) {

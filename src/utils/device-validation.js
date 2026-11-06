@@ -31,13 +31,30 @@ export const ISSUE_STATUSES = ['error', 'conflict', 'nonCompliant', 'pending', '
 // Summarise a policy's Graph assignments (any Intune policy type — they all
 // share the deviceAndAppManagementAssignmentTarget shape).
 export const summarizeAssignments = (assignments = []) => {
-  const summary = { allDevices: false, allUsers: false, groups: 0, exclusions: 0 };
+  const summary = {
+    allDevices: false, allUsers: false, groups: 0, exclusions: 0,
+    includeGroupIds: [], excludeGroupIds: [],
+    // Assignment filters: { id, mode: 'include' | 'exclude', target }
+    filters: [],
+  };
   assignments.forEach(assignment => {
-    const type = (assignment?.target?.['@odata.type'] || '').toLowerCase();
-    if (type.includes('alldevices')) summary.allDevices = true;
-    else if (type.includes('alllicensedusers')) summary.allUsers = true;
-    else if (type.includes('exclusiongroup')) summary.exclusions += 1;
-    else if (type.includes('groupassignment')) summary.groups += 1;
+    const target = assignment?.target || {};
+    const type = (target['@odata.type'] || '').toLowerCase();
+    let targetLabel = null;
+    if (type.includes('alldevices')) { summary.allDevices = true; targetLabel = 'All devices'; }
+    else if (type.includes('alllicensedusers')) { summary.allUsers = true; targetLabel = 'All users'; }
+    else if (type.includes('exclusiongroup')) { summary.exclusions += 1; summary.excludeGroupIds.push(target.groupId); }
+    else if (type.includes('groupassignment')) {
+      summary.groups += 1;
+      summary.includeGroupIds.push(target.groupId);
+      targetLabel = target.groupId;
+    }
+
+    const filterId = target.deviceAndAppManagementAssignmentFilterId;
+    const filterType = (target.deviceAndAppManagementAssignmentFilterType || '').toLowerCase();
+    if (filterId && filterId !== '00000000-0000-0000-0000-000000000000' && filterType !== 'none') {
+      summary.filters.push({ id: filterId, mode: filterType || 'include', target: targetLabel });
+    }
   });
   summary.hasIncludes = summary.allDevices || summary.allUsers || summary.groups > 0;
   const parts = [
@@ -69,7 +86,9 @@ export const mapComplianceState = (state) => {
   switch ((state || '').toLowerCase()) {
     case 'compliant':
     case 'remediated':    return 'succeeded';
-    case 'noncompliant':  return 'nonCompliant';
+    case 'noncompliant':
+    case 'notcompliant':  // report text "Not compliant"
+    case 'ingraceperiod': return 'nonCompliant';
     case 'error':         return 'error';
     case 'conflict':      return 'conflict';
     case 'notapplicable': return 'notApplicable';

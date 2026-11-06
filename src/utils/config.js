@@ -13,6 +13,11 @@ export const CONFIG = {
         deviceScopes: [
             'https://graph.microsoft.com/DeviceManagementConfiguration.ReadWrite.All',
             'https://graph.microsoft.com/DeviceManagementManagedDevices.Read.All'
+        ],
+        // Requested incrementally to show Entra group names for assignments.
+        groupScopes: [
+            'https://graph.microsoft.com/DeviceManagementConfiguration.ReadWrite.All',
+            'https://graph.microsoft.com/GroupMember.Read.All'
         ]
     },
 

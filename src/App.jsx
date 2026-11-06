@@ -13,7 +13,9 @@ import QuickDeployWizard from './components/QuickDeployWizard';
 import ComparisonDashboard from './components/ComparisonDashboard';
 import OSSelectionWizard from './components/OSSelectionWizard';
 import ValidationDashboard from './components/ValidationDashboard';
-import DeviceValidationDashboard, { DEVICE_RESUME_KEY } from './components/DeviceValidationDashboard';
+import DeviceValidationDashboard from './components/DeviceValidationDashboard';
+import { saveConsentResume, takeConsentResume } from './utils/consent-resume';
+import { CONFIG } from './utils/config';
 import authService from './utils/auth';
 import graphAPI from './utils/graph-api';
 import githubAPI from './utils/github-api';
@@ -98,27 +100,39 @@ function App() {
     loadReleaseManifest();
   }, []);
 
-  // Device Validation sends the user to Entra ID to consent to an extra
-  // scope. When they come back, pick up where they left off once the
-  // release manifest (needed to resolve policy sources) has loaded.
+  // Device Validation and the assignment overview send the user to Entra ID
+  // to consent to an extra scope. When they come back, pick up where they
+  // left off once the release manifest (needed to resolve policy sources)
+  // has loaded.
+  const [autoLoadAssignmentStatus, setAutoLoadAssignmentStatus] = useState(false);
+
   useEffect(() => {
     if (!isAuthenticated || isLoadingReleaseManifest || releasePlatforms.length === 0) return;
-    let resume = null;
-    try {
-      resume = JSON.parse(sessionStorage.getItem(DEVICE_RESUME_KEY) || 'null');
-      sessionStorage.removeItem(DEVICE_RESUME_KEY);
-    } catch {
-      return;
-    }
-    if (!resume?.osTypes?.length || Date.now() - (resume.timestamp || 0) > 15 * 60 * 1000) return;
+    const resume = takeConsentResume();
+    if (!resume) return;
 
-    setAllowPrerelease(!!resume.allowPrerelease);
-    setDeploymentType('device');
+    setAllowPrerelease(resume.allowPrerelease);
+    setDeploymentType(resume.deploymentType);
     setSelectedOSTypes(resume.osTypes);
+    setAutoLoadAssignmentStatus(!!resume.autoLoadStatus);
     setWizardStep('comparison-dashboard');
-    loadPoliciesForSelectedOS(resume.osTypes, !!resume.allowPrerelease);
+    loadPoliciesForSelectedOS(resume.osTypes, resume.allowPrerelease);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAuthenticated, isLoadingReleaseManifest, releasePlatforms]);
+
+  const handleRequestGroupConsent = async () => {
+    saveConsentResume({
+      deploymentType: deploymentType || 'existing',
+      osTypes: selectedOSTypes,
+      allowPrerelease,
+      autoLoadStatus: true,
+    });
+    try {
+      await authService.requestAdditionalScopes(CONFIG.msal.groupScopes);
+    } catch (error) {
+      setError('Could not start the consent flow: ' + error.message);
+    }
+  };
 
   // Update page title based on current step
   useEffect(() => {
@@ -882,6 +896,10 @@ function App() {
             onComparisonReady={handleComparisonReady}
             isLoading={isLoading}
             selectedVersion={latestVersion}
+            showAssignmentStatus={deploymentType === 'existing'}
+            autoLoadAssignmentStatus={autoLoadAssignmentStatus}
+            onAutoLoadConsumed={() => setAutoLoadAssignmentStatus(false)}
+            onRequestGroupConsent={handleRequestGroupConsent}
           />
         )}
 
