@@ -13,6 +13,7 @@ import QuickDeployWizard from './components/QuickDeployWizard';
 import ComparisonDashboard from './components/ComparisonDashboard';
 import OSSelectionWizard from './components/OSSelectionWizard';
 import ValidationDashboard from './components/ValidationDashboard';
+import DeviceValidationDashboard, { DEVICE_RESUME_KEY } from './components/DeviceValidationDashboard';
 import authService from './utils/auth';
 import graphAPI from './utils/graph-api';
 import githubAPI from './utils/github-api';
@@ -55,7 +56,7 @@ function App() {
   }, [darkMode]);
 
   // New wizard state variables
-  const [deploymentType, setDeploymentType] = useState(null); // 'new', 'existing', or 'validate'
+  const [deploymentType, setDeploymentType] = useState(null); // 'new', 'existing', 'validate' or 'device'
   const [selectedPolicyTypes, setSelectedPolicyTypes] = useState([]); // ['compliance', 'endpoint-security', etc.]
   const [selectedOSTypes, setSelectedOSTypes] = useState([]); // ['WINDOWS', 'MACOS']
   const [tenantLicensing, setTenantLicensing] = useState(null); // 'business-premium' | 'e3-e5-e7'
@@ -96,6 +97,28 @@ function App() {
   useEffect(() => {
     loadReleaseManifest();
   }, []);
+
+  // Device Validation sends the user to Entra ID to consent to an extra
+  // scope. When they come back, pick up where they left off once the
+  // release manifest (needed to resolve policy sources) has loaded.
+  useEffect(() => {
+    if (!isAuthenticated || isLoadingReleaseManifest || releasePlatforms.length === 0) return;
+    let resume = null;
+    try {
+      resume = JSON.parse(sessionStorage.getItem(DEVICE_RESUME_KEY) || 'null');
+      sessionStorage.removeItem(DEVICE_RESUME_KEY);
+    } catch {
+      return;
+    }
+    if (!resume?.osTypes?.length || Date.now() - (resume.timestamp || 0) > 15 * 60 * 1000) return;
+
+    setAllowPrerelease(!!resume.allowPrerelease);
+    setDeploymentType('device');
+    setSelectedOSTypes(resume.osTypes);
+    setWizardStep('comparison-dashboard');
+    loadPoliciesForSelectedOS(resume.osTypes, !!resume.allowPrerelease);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthenticated, isLoadingReleaseManifest, releasePlatforms]);
 
   // Update page title based on current step
   useEffect(() => {
@@ -186,7 +209,8 @@ function App() {
     const workflowEvents = {
       new: 'New Deployment',
       existing: 'Existing Deployment',
-      validate: 'Policy Validation'
+      validate: 'Policy Validation',
+      device: 'Device Validation'
     };
 
     if (workflowEvents[type] && typeof window.plausible === 'function') {
@@ -196,7 +220,7 @@ function App() {
     setDeploymentType(type);
     if (type === 'new') {
       setWizardStep('policy-types');
-    } else if (type === 'existing' || type === 'validate') {
+    } else if (type === 'existing' || type === 'validate' || type === 'device') {
       setWizardStep('os-selection');
     }
   };
@@ -208,9 +232,13 @@ function App() {
     loadPoliciesForSelectedOS(osTypes);
   };
 
-  const loadPoliciesForSelectedOS = async (osTypes) => {
+  const loadPoliciesForSelectedOS = async (osTypes, prereleaseOverride) => {
     try {
-      const policySources = getPolicySources(releasePlatforms, osTypes, allowPrerelease);
+      const policySources = getPolicySources(
+        releasePlatforms,
+        osTypes,
+        prereleaseOverride ?? allowPrerelease
+      );
       const versionLabel = Object.entries(policySources)
         .map(([osType, source]) => `${osType}: ${source.name} (${source.channel})`)
         .join(', ');
@@ -336,7 +364,7 @@ function App() {
       setDeploymentType(null);
       setLatestVersion(null);
     } else if (wizardStep === 'comparison-dashboard') {
-      if (deploymentType === 'existing' || deploymentType === 'validate') {
+      if (deploymentType === 'existing' || deploymentType === 'validate' || deploymentType === 'device') {
         setWizardStep('os-selection');
         setSelectedOSTypes([]);
       } else {
@@ -550,7 +578,14 @@ function App() {
     // jump straight to validation once matches are computed.
     if (deploymentType === 'validate') {
       setWizardStep('validation');
+    } else if (deploymentType === 'device') {
+      setWizardStep('device-validation');
     }
+  };
+
+  const handleDeviceValidationBack = () => {
+    setWizardStep('os-selection');
+    setSelectedOSTypes([]);
   };
 
   const handleValidationBack = () => {
@@ -884,6 +919,16 @@ function App() {
             isValidating={isValidating}
             validatingPolicy={validatingPolicy}
             onBack={handleValidationBack}
+          />
+        )}
+
+        {isAuthenticated && !showDocumentation && currentStep === 'wizard' && wizardStep === 'device-validation' && (
+          <DeviceValidationDashboard
+            comparisonData={comparisonData}
+            selectedOSTypes={selectedOSTypes}
+            allowPrerelease={allowPrerelease}
+            selectedVersion={latestVersion}
+            onBack={handleDeviceValidationBack}
           />
         )}
 

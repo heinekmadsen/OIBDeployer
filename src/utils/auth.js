@@ -1,5 +1,16 @@
-import { PublicClientApplication } from '@azure/msal-browser';
+import { PublicClientApplication, InteractionRequiredAuthError } from '@azure/msal-browser';
 import { CONFIG } from './config.js';
+
+// Thrown when a token for extra scopes cannot be acquired silently — the
+// user (or an admin) has to consent to the additional permission first.
+export class ConsentRequiredError extends Error {
+    constructor(scopes, cause) {
+        super('Additional permissions are required: ' + scopes.map(s => s.split('/').pop()).join(', '));
+        this.name = 'ConsentRequiredError';
+        this.scopes = scopes;
+        this.cause = cause;
+    }
+}
 
 class AuthService {
     constructor() {
@@ -113,6 +124,41 @@ class AuthService {
                 throw new Error('Failed to acquire access token');
             }
         }
+    }
+
+    // Acquire a token for specific scopes without ever redirecting. Used for
+    // incremental consent: callers show their own "grant access" UI when this
+    // throws ConsentRequiredError instead of the page navigating away.
+    async getAccessTokenForScopes(scopes) {
+        if (!this.account) {
+            throw new Error('No account available');
+        }
+
+        try {
+            const response = await this.msalInstance.acquireTokenSilent({
+                scopes,
+                account: this.account
+            });
+            return response.accessToken;
+        } catch (error) {
+            const consentCodes = ['consent_required', 'interaction_required', 'invalid_grant', 'login_required'];
+            if (error instanceof InteractionRequiredAuthError || consentCodes.includes(error?.errorCode)) {
+                throw new ConsentRequiredError(scopes, error);
+            }
+            throw error;
+        }
+    }
+
+    // Redirect to Entra ID to consent to additional scopes. The page reloads
+    // afterwards, so callers should persist any state they want to resume.
+    async requestAdditionalScopes(scopes) {
+        if (!this.isInitialized) {
+            throw new Error('Auth service not initialized');
+        }
+        await this.msalInstance.acquireTokenRedirect({
+            scopes,
+            account: this.account
+        });
     }
 
     isAuthenticated() {

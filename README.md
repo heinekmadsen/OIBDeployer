@@ -24,6 +24,7 @@ Before running the application, you must create an Entra ID App Registration:
 5. Note the **Application (client) ID** - you'll need this for configuration
 6. Under **API permissions**, add:
    - **Microsoft Graph**: `DeviceManagementConfiguration.ReadWrite.All` (Delegated permission)
+   - (Optional, for Device Validation) **Microsoft Graph**: `DeviceManagementManagedDevices.Read.All` (Delegated permission, requires admin consent). The app requests it incrementally the first time Device Validation is used.
    - (Optional) Grant admin consent for your organization
 7. Under **Authentication**, click **Add a platform** and select **Single-page application**, then add your redirect URI(s) there (this app uses the authorization code + PKCE flow via MSAL.js, not the legacy implicit grant — do not enable implicit grant tokens)
 

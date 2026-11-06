@@ -1,5 +1,5 @@
 import React from 'react';
-import { Package, Search, ShieldCheck, ArrowRight, HelpCircle } from 'lucide-react';
+import { Package, Search, ShieldCheck, MonitorCheck, ArrowRight, HelpCircle } from 'lucide-react';
 
 const DeploymentTypeWizard = ({ onSelectType, onBack }) => {
   return (
@@ -72,12 +72,33 @@ const DeploymentTypeWizard = ({ onSelectType, onBack }) => {
             <ArrowRight size={24} />
           </div>
         </div>
+
+        <div
+          className="deployment-type-card device-validation"
+          onClick={() => onSelectType('device')}
+        >
+          <div className="card-icon">
+            <MonitorCheck size={48} />
+          </div>
+          <div className="card-content">
+            <h3>Device Validation</h3>
+            <p>Pick a device and check whether every OIB policy has actually been delivered to it</p>
+            <div className="card-features">
+              <span>• Per-device status: applied, error, conflict, pending</span>
+              <span>• Spot OIB policies not assigned to the device</span>
+              <span>• Read-only (needs DeviceManagementManagedDevices.Read.All)</span>
+            </div>
+          </div>
+          <div className="card-action">
+            <ArrowRight size={24} />
+          </div>
+        </div>
       </div>
 
       <div className="wizard-help">
         <div className="help-item">
           <HelpCircle size={16} />
-          <span>Not sure which option to choose? Select "New Deployment" if this is your first time using OIBDeployer, "Existing Deployment" to compare and update previously deployed policies, or "Policy Validation" to check deployed policies for configuration drift.</span>
+          <span>Not sure which option to choose? Select "New Deployment" if this is your first time using OIBDeployer, "Existing Deployment" to compare and update previously deployed policies, "Policy Validation" to check deployed policies for configuration drift, or "Device Validation" to check what has reached a specific device.</span>
         </div>
       </div>
 

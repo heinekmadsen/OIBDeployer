@@ -31,6 +31,7 @@ const Documentation = ({ onBack }) => {
                 <p>Select "New Deployment" if you're deploying the OIB for the first time.</p>
                 <p>Select "Existing Deployment" if you've already deployed the OIB and want to compare it against the latest version, then deploy any missing or outdated policies.</p>
                 <p>Select "Policy Validation" to check your already-deployed OIB policies for per-setting configuration drift against the baseline &mdash; this is read-only and makes no changes to your tenant.</p>
+                <p>Select "Device Validation" to pick a specific managed device and see which OIB policies have actually been delivered to it &mdash; also read-only.</p>
               </div>
             </div>
             <div className="step">
@@ -47,6 +48,7 @@ const Documentation = ({ onBack }) => {
                 <p><strong>New:</strong> Answer a couple of quick questions about your tenant's licensing and Windows Update strategy (so irrelevant policies can be filtered out), then select and deploy the policies you want.</p>
                 <p><strong>Existing:</strong> Compare your tenant against the latest OIB version, then deploy any missing or outdated policies.</p>
                 <p><strong>Validation:</strong> Review a per-setting drift report for each matched policy against the OIB baseline.</p>
+                <p><strong>Device Validation:</strong> Search for a device and see, per OIB policy, whether it applied, errored, conflicted, is pending, or isn't assigned to that device.</p>
               </div>
             </div>
           </div>
@@ -83,6 +85,10 @@ const Documentation = ({ onBack }) => {
               <li><code>DeviceManagementConfiguration.ReadWrite.All</code></li>
             </ul>
             <p>If your account has Intune Administrator role (or higher), this will allow the above.</p>
+            <p>
+              Device Validation additionally requests <code>DeviceManagementManagedDevices.Read.All</code> (read-only) the first time you use it.
+              This permission requires admin consent, so you may need an administrator to approve it for the app registration.
+            </p>
           </div>
 
           <div className="faq-item">
@@ -114,6 +120,17 @@ const Documentation = ({ onBack }) => {
               Policy Validation is a read-only flow that compares each matched policy's individual settings against the OIB baseline, highlighting any drift: 
               mismatched values, settings present in the baseline but missing from the tenant, or extra settings present in the tenant but not the baseline. 
               It currently supports Settings Catalog, Endpoint Security, and Compliance policies. No changes are ever made to your tenant during validation.
+            </p>
+          </div>
+
+          <div className="faq-item">
+            <h3>What is Device Validation?</h3>
+            <p>
+              Device Validation shows whether the OIB policies in your tenant have actually reached a specific device. It reads Intune's per-device
+              report (the same data as <em>Devices &rsaquo; device &rsaquo; Device configuration</em> in the Intune admin center) plus the device's compliance
+              policy states, and lists each OIB policy as Applied, Error, Conflict, Pending, or Not deployed in the tenant. When the device has no
+              report for a policy, the policy's assignments are read to tell "assigned, but not reported by the device yet" apart from "no assignments in the tenant".
+              App Protection policies and Windows feature/quality/driver update profiles aren't reported per device by these APIs and are marked as such.
             </p>
           </div>
 

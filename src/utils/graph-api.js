@@ -1400,6 +1400,196 @@ class GraphAPI {
             };
         }
     }
+
+    // ── Device Validation ─────────────────────────────────────────────────────
+    // These calls need DeviceManagementManagedDevices.Read.All on top of the
+    // base scope. Tokens are acquired silently only; a ConsentRequiredError
+    // bubbles up so the UI can offer a "grant access" step.
+
+    async makeDeviceRequest(endpoint, method = 'GET', body = null) {
+        const token = await authService.getAccessTokenForScopes(CONFIG.msal.deviceScopes);
+        const url = endpoint.startsWith('https://') ? endpoint : `${this.config.baseUrl}${endpoint}`;
+        const options = {
+            method,
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            }
+        };
+        if (body) options.body = JSON.stringify(body);
+
+        const response = await this.makeRequestWithRetry(url, options);
+        if (!response.ok) {
+            const errorText = await response.text();
+            const error = new Error(`Graph API error: ${response.status} ${response.statusText} - ${errorText}`);
+            error.status = response.status;
+            throw error;
+        }
+        if (response.status === 204) return null;
+
+        // Report actions can come back as application/octet-stream, so parse
+        // the text ourselves rather than relying on response.json().
+        const text = await response.text();
+        return text ? JSON.parse(text) : null;
+    }
+
+    static escapeODataString(value) {
+        return String(value).replace(/'/g, "''");
+    }
+
+    /**
+     * Search Intune managed devices by device name or primary user UPN prefix.
+     * An empty query returns the first page of devices.
+     */
+    async searchManagedDevices(query = '') {
+        const select = '$select=id,deviceName,operatingSystem,osVersion,model,manufacturer,serialNumber,' +
+            'userPrincipalName,userDisplayName,lastSyncDateTime,complianceState,managementAgent,azureADDeviceId';
+        const base = '/deviceManagement/managedDevices';
+        const trimmed = query.trim();
+
+        if (!trimmed) {
+            const result = await this.makeDeviceRequest(`${base}?${select}&$top=50`);
+            return result?.value ?? [];
+        }
+
+        const escaped = encodeURIComponent(GraphAPI.escapeODataString(trimmed));
+        const filters = [
+            `startswith(deviceName,'${escaped}')`,
+            `startswith(userPrincipalName,'${escaped}')`,
+            `serialNumber eq '${escaped}'`
+        ];
+
+        const results = await Promise.allSettled(
+            filters.map(filter => this.makeDeviceRequest(`${base}?$filter=${filter}&${select}&$top=50`))
+        );
+
+        // Surface consent problems rather than silently returning nothing.
+        const consentFailure = results.find(r => r.status === 'rejected' && r.reason?.name === 'ConsentRequiredError');
+        if (consentFailure) throw consentFailure.reason;
+        if (results.every(r => r.status === 'rejected')) throw results[0].reason;
+
+        const byId = new Map();
+        results.forEach(r => {
+            if (r.status !== 'fulfilled') return;
+            (r.value?.value ?? []).forEach(device => byId.set(device.id, device));
+        });
+        return [...byId.values()].sort((a, b) => (a.deviceName || '').localeCompare(b.deviceName || ''));
+    }
+
+    async getManagedDevice(deviceId) {
+        return this.makeDeviceRequest(`/deviceManagement/managedDevices/${encodeURIComponent(deviceId)}`);
+    }
+
+    /**
+     * Per-device configuration status — the same report the Intune portal
+     * shows under Devices > {device} > Device configuration. Covers Settings
+     * Catalog, Endpoint Security (intents), Admin Templates and legacy device
+     * configuration profiles. Returns one row per policy per user/device context.
+     */
+    async getDeviceConfigurationReport(deviceId) {
+        if (!/^[0-9a-f-]{36}$/i.test(deviceId)) {
+            throw new Error(`Invalid Intune device ID: ${deviceId}`);
+        }
+
+        const baseTypes = [
+            'Microsoft.Management.Services.Api.DeviceConfiguration',
+            'DeviceManagementConfigurationPolicy',
+            'DeviceConfigurationAdmxPolicy',
+            'Microsoft.Management.Services.Api.DeviceManagementIntent'
+        ];
+        const filter = `(${baseTypes.map(t => `(PolicyBaseTypeName eq '${t}')`).join(' or ')}) and (IntuneDeviceId eq '${deviceId}')`;
+        const select = [
+            'IntuneDeviceId', 'PolicyBaseTypeName', 'PolicyId', 'PolicyStatus', 'UPN', 'UserId',
+            'PspdpuLastModifiedTimeUtc', 'PolicyName', 'UnifiedPolicyType'
+        ];
+
+        const PAGE_SIZE = 50;
+        const rows = [];
+        let schema = null;
+        let total = null;
+
+        for (let skip = 0; skip < 5000; skip += PAGE_SIZE) {
+            const page = await this.makeDeviceRequest(
+                '/deviceManagement/reports/getConfigurationPoliciesReportForDevice',
+                'POST',
+                { select, filter, skip, top: PAGE_SIZE, orderBy: ['PolicyName'] }
+            );
+
+            schema = schema || page?.Schema || page?.schema;
+            const values = page?.Values || page?.values || [];
+            if (total === null && page?.TotalRowCount != null) total = Number(page.TotalRowCount);
+
+            const columns = (schema || []).map(col => col.Column ?? col.column);
+            values.forEach(valueRow => {
+                const row = {};
+                columns.forEach((col, i) => { row[col] = valueRow[i]; });
+                rows.push(row);
+            });
+
+            if (values.length < PAGE_SIZE || (total !== null && rows.length >= total)) break;
+        }
+
+        return rows;
+    }
+
+    /**
+     * Per-device compliance policy states. Compliance policies are not part of
+     * the configuration report, so they are read from the managed device.
+     */
+    async getDeviceCompliancePolicyStates(deviceId) {
+        const result = await this.makeDeviceRequest(
+            `/deviceManagement/managedDevices/${encodeURIComponent(deviceId)}/deviceCompliancePolicyStates`
+        );
+        return result?.value ?? [];
+    }
+
+    /**
+     * Assignments for a normalised tenant policy (see getEndpointGroupsForOS).
+     * Used to explain why a device has no report for a policy.
+     */
+    async getPolicyAssignments(tenantPolicy) {
+        const endpoints = {
+            configurationPolicy: '/deviceManagement/configurationPolicies',
+            compliance: '/deviceManagement/deviceCompliancePolicies',
+            deviceConfiguration: '/deviceManagement/deviceConfigurations',
+            adminTemplate: '/deviceManagement/groupPolicyConfigurations',
+            endpointSecurity: '/deviceManagement/intents'
+        };
+        const base = endpoints[tenantPolicy?.type];
+        if (!base) throw new Error(`Assignments not supported for policy type ${tenantPolicy?.type}`);
+
+        const result = await this.makeDeviceRequest(`${base}/${encodeURIComponent(tenantPolicy.id)}/assignments`);
+        return result?.value ?? [];
+    }
+
+    /**
+     * Fetch everything Device Validation needs for one device. Each source is
+     * fetched independently so a failure in one (e.g. a retired API) still
+     * lets the others render. Consent errors are re-thrown.
+     */
+    async getDevicePolicyStatus(deviceId) {
+        const [device, configuration, compliance] = await Promise.allSettled([
+            this.getManagedDevice(deviceId),
+            this.getDeviceConfigurationReport(deviceId),
+            this.getDeviceCompliancePolicyStates(deviceId)
+        ]);
+
+        const consentFailure = [device, configuration, compliance]
+            .find(r => r.status === 'rejected' && r.reason?.name === 'ConsentRequiredError');
+        if (consentFailure) throw consentFailure.reason;
+
+        return {
+            device: device.status === 'fulfilled' ? device.value : null,
+            configurationRows: configuration.status === 'fulfilled' ? configuration.value : [],
+            complianceStates: compliance.status === 'fulfilled' ? compliance.value : [],
+            errors: {
+                device: device.status === 'rejected' ? device.reason.message : null,
+                configuration: configuration.status === 'rejected' ? configuration.reason.message : null,
+                compliance: compliance.status === 'rejected' ? compliance.reason.message : null
+            },
+            fetchedAt: new Date().toISOString()
+        };
+    }
 }
 
 // Create singleton instance

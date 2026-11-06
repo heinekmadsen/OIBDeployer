@@ -7,6 +7,12 @@ export const CONFIG = {
         redirectUri: window.location.origin, // Dynamic redirect URI
         scopes: [
             'https://graph.microsoft.com/DeviceManagementConfiguration.ReadWrite.All'
+        ],
+        // Requested incrementally, only when Device Validation is used, so
+        // existing deploy/compare flows keep working with the base permission.
+        deviceScopes: [
+            'https://graph.microsoft.com/DeviceManagementConfiguration.ReadWrite.All',
+            'https://graph.microsoft.com/DeviceManagementManagedDevices.Read.All'
         ]
     },
 
