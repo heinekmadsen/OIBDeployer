@@ -2,7 +2,8 @@ name: Deploy to GitHub Pages
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, feature/assignment-groups ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -45,7 +46,7 @@ jobs:
     name: Deploy
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/assignment-groups'
 
     permissions:
       pages: write
