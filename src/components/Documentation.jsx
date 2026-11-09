@@ -188,9 +188,38 @@ const Documentation = ({ onBack }) => {
               needed, and finish when you're ready:
             </p>
             <ul>
-              <li>If the old version is assigned through its own group (e.g. <em>… v3.7 - Include</em>), members are moved from that group to the new version's include group.</li>
-              <li>If it is assigned to All devices, All users or groups shared with other policies, those are left untouched: moved members are added to the old version's exclude group and the new version's include group.</li>
-              <li>"Finish migration" moves everyone that's left (or gives the new version the old version's assignments) and removes all assignments from the old version. The old policy is not deleted.</li>
+              <li>
+                Moved devices or users are added to the new version&apos;s pilot group, <em>{'{prefix}{policy name} - Pilot{suffix}'}</em>, and to the
+                old version&apos;s exclude group. Both are created on the first move.
+              </li>
+              <li>
+                The old version&apos;s include groups, All devices or All users assignments are never changed during the migration. An exclusion
+                always wins in Intune, also when a device is in a group through a nested or dynamic group, and shared groups stay intact for
+                other policies. &quot;Move back&quot; removes the member from both groups again.
+              </li>
+              <li>
+                "Finish migration" lets you choose how the new version is assigned afterwards:
+                <ul>
+                  <li>
+                    <strong>All devices / All users:</strong> the pilot group is unassigned and its members are taken out (the empty group is
+                    kept). New devices get the policy automatically.
+                  </li>
+                  <li>
+                    <strong>Include/exclude groups:</strong> the pilot group is renamed to <em>… - Include</em>, or, if the new version already has an
+                    include group, its members join that one and the pilot group is unassigned and emptied. Everyone still on the old version
+                    joins too. If the old version was on All devices, that adds every device of the platform as a snapshot, so devices enrolled
+                    later must be added by hand.
+                  </li>
+                </ul>
+                Either way, all assignments are then removed from the old version and everyone is taken out of its own groups (e.g.{' '}
+                <em>… v3.7 - Include</em> and <em>… v3.7 - Exclude</em>). The empty groups are kept for you to delete, and groups shared with other
+                policies aren&apos;t changed. Devices that were excluded from the old version for other reasons than the migration stay excluded:
+                they move to the new version&apos;s exclude group first. The old policy itself is not deleted.
+              </li>
+              <li>
+                If the new version is already assigned to All devices or All users, everyone gets both versions and there is nothing to pilot.
+                The dialog then offers to take the new version off All devices so you can pilot it, or to finish right away.
+              </li>
             </ul>
           </div>
 

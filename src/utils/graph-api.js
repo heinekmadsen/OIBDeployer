@@ -5,6 +5,7 @@ import {
     buildGroupName,
     buildMailNickname,
     builtInTarget,
+    deviceMatchesPlatform,
     groupTarget,
     mergeAssignmentTargets,
     normaliseDirectoryObject,
@@ -1956,6 +1957,14 @@ class GraphAPI {
         return { id: group.id, displayName: group.displayName, created: true, dynamic: false, duplicates: 0 };
     }
 
+    // Rename a group (and update its description). mailNickname is left as is.
+    async renameGroup(groupId, displayName, description = null) {
+        await this.makeGroupRequest(`/groups/${encodeURIComponent(groupId)}`, 'PATCH', {
+            displayName,
+            ...(description ? { description: description.slice(0, 1024) } : {})
+        });
+    }
+
     // Collection a policy lives in, for /assignments and /assign.
     static assignmentCollectionFor(policy) {
         if (policy?.endpoint) return policy.endpoint;
@@ -2113,6 +2122,46 @@ class GraphAPI {
         }
         const results = await Promise.all(requests);
         return results.flat();
+    }
+
+    async listAllGroupScoped(endpoint) {
+        const items = [];
+        let next = endpoint;
+        while (next) {
+            const page = await this.makeGroupRequest(next);
+            items.push(...(page?.value ?? []));
+            next = page?.['@odata.nextLink'] ?? null;
+        }
+        return items;
+    }
+
+    /**
+     * Everyone a policy assigned to All devices / All users reaches, as
+     * directory objects that can be added to a group: Entra devices of the
+     * policy's platform, and/or member users (guests are skipped).
+     *
+     * @param types     ['device'] and/or ['user']
+     * @param platform  policyPlatform() value; null lists every device
+     */
+    async listAudience(types, platform = null) {
+        const members = [];
+        if (types.includes('device')) {
+            const devices = await this.listAllGroupScoped(
+                '/devices?$select=id,displayName,operatingSystem,operatingSystemVersion&$top=999'
+            );
+            members.push(...devices
+                .filter(d => deviceMatchesPlatform(d.operatingSystem, platform))
+                .map(d => normaliseDirectoryObject({ '@odata.type': '#microsoft.graph.device', ...d })));
+        }
+        if (types.includes('user')) {
+            // userType isn't in the basic profile User.ReadBasic.All allows,
+            // so guests are recognised by their #EXT# UPN.
+            const users = await this.listAllGroupScoped('/users?$select=id,displayName,userPrincipalName&$top=999');
+            members.push(...users
+                .filter(u => !String(u.userPrincipalName ?? '').includes('#EXT#'))
+                .map(u => normaliseDirectoryObject({ '@odata.type': '#microsoft.graph.user', ...u })));
+        }
+        return members;
     }
 }
 

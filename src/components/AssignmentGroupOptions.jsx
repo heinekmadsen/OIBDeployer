@@ -152,8 +152,9 @@ const AssignmentGroupOptions = ({ options, onChange, policyNames = [], onAccessC
             {builtInMode && (
               <>
                 {' '}App protection policies and Windows feature, quality and driver update profiles can&apos;t be assigned
-                this way and are left unassigned. To pilot a new OIB version first, choose an include group, then use
-                &quot;Migrate devices…&quot; in Existing Deployment.
+                this way and are left unassigned. To pilot a new OIB version first, don&apos;t assign it to everyone here:
+                choose an include group (or turn this off) and use &quot;Migrate devices…&quot; in Existing Deployment, which
+                pilots it through a &quot;- Pilot&quot; group.
               </>
             )}
           </div>

@@ -6,6 +6,9 @@ export const DEFAULT_GROUP_NAMING = Object.freeze({
   suffix: '',
   includeLabel: 'Include',
   excludeLabel: 'Exclude',
+  // Version migrations pilot a new version through its own group, which
+  // becomes the include group (or is emptied) when the migration finishes.
+  pilotLabel: 'Pilot',
 });
 
 export const MAX_GROUP_NAME_LENGTH = 256;
@@ -23,6 +26,7 @@ export function loadGroupNaming() {
       suffix: typeof parsed.suffix === 'string' ? parsed.suffix : '',
       includeLabel: typeof parsed.includeLabel === 'string' ? parsed.includeLabel : DEFAULT_GROUP_NAMING.includeLabel,
       excludeLabel: typeof parsed.excludeLabel === 'string' ? parsed.excludeLabel : DEFAULT_GROUP_NAMING.excludeLabel,
+      pilotLabel: typeof parsed.pilotLabel === 'string' && parsed.pilotLabel.trim() ? parsed.pilotLabel : DEFAULT_GROUP_NAMING.pilotLabel,
     };
   } catch {
     return { ...DEFAULT_GROUP_NAMING };
@@ -46,7 +50,12 @@ export function policyDisplayName(name) {
  * Prefix and suffix are used verbatim, so the user controls separators.
  */
 export function buildGroupName(policyName, kind, naming = DEFAULT_GROUP_NAMING) {
-  const label = String((kind === 'exclude' ? naming.excludeLabel : naming.includeLabel) ?? '').trim();
+  const labels = {
+    include: naming.includeLabel,
+    exclude: naming.excludeLabel,
+    pilot: naming.pilotLabel || DEFAULT_GROUP_NAMING.pilotLabel,
+  };
+  const label = String(labels[kind] ?? naming.includeLabel ?? '').trim();
   const base = policyDisplayName(policyName);
   return `${naming.prefix ?? ''}${base}${label ? ` - ${label}` : ''}${naming.suffix ?? ''}`.trim();
 }
@@ -306,9 +315,14 @@ export function isDedicatedGroup(groupName, policyName) {
 function findOwnGroup(policyName, groupIds, groupNames, kind, naming) {
   const wanted = buildGroupName(policyName, kind, naming);
   const named = groupIds.map(id => ({ id, name: groupNames?.get(id.toLowerCase()) ?? null }));
+  const pilotLabel = normalise(`- ${naming.pilotLabel || DEFAULT_GROUP_NAMING.pilotLabel}`);
+  const isPilot = (g) => !!g.name && normalise(g.name).includes(pilotLabel);
   const exact = named.find(g => normalise(g.name) === normalise(wanted));
   if (exact) return { id: exact.id, name: exact.name, existing: true };
-  const dedicated = named.find(g => g.name && isDedicatedGroup(g.name, policyName));
+  // Any other group named after the policy (e.g. after the prefix changed),
+  // telling pilot groups and include groups apart by the pilot label.
+  const dedicated = named.find(g => g.name && isDedicatedGroup(g.name, policyName)
+    && (kind === 'pilot' ? isPilot(g) : !isPilot(g)));
   if (dedicated) return { id: dedicated.id, name: dedicated.name, existing: true };
   return { id: null, name: wanted, existing: false };
 }
@@ -316,13 +330,11 @@ function findOwnGroup(policyName, groupIds, groupNames, kind, naming) {
 /**
  * How devices (or users) move from a legacy policy version to the current one.
  *
- * - strategy 'move': the old version is only assigned through groups that
- *   belong to it, so members are moved out of that group into the new
- *   version's include group.
- * - strategy 'exclude': the old version is assigned to All devices / All
- *   users or to shared groups. Removing members from shared groups would
- *   affect other policies, so members are added to the old version's exclude
- *   group and the new version's include group instead.
+ * - strategy 'exclude': moved members are added to the old version's exclude
+ *   group and the new version's pilot group. The old version's include
+ *   groups are never changed: an exclusion wins even when a member is in
+ *   them through a nested or dynamic group, and shared groups stay intact
+ *   for the other policies that use them.
  * - strategy 'none': the old version isn't assigned; nothing to migrate.
  *
  * @param legacyAssignment / currentAssignment  summarizeAssignments() results
@@ -331,13 +343,17 @@ function findOwnGroup(policyName, groupIds, groupNames, kind, naming) {
 export function planVersionMigration({ legacyPolicy, currentPolicy, legacyAssignment, currentAssignment, groupNames, naming = DEFAULT_GROUP_NAMING }) {
   const legacyName = nameOf(legacyPolicy);
   const currentName = nameOf(currentPolicy);
-  const currentInclude = findOwnGroup(currentName, currentAssignment?.includeGroupIds ?? [], groupNames, 'include', naming);
+  const currentIncludeIds = currentAssignment?.includeGroupIds ?? [];
   const legacyIncludeIds = legacyAssignment?.includeGroupIds ?? [];
 
   const base = {
     legacyName,
     currentName,
-    currentIncludeGroup: currentInclude,
+    // Moved members go to the pilot group; when the migration finishes with
+    // groups it becomes (or joins) the include group.
+    currentPilotGroup: findOwnGroup(currentName, currentIncludeIds, groupNames, 'pilot', naming),
+    currentIncludeGroup: findOwnGroup(currentName, currentIncludeIds, groupNames, 'include', naming),
+    currentExcludeGroup: findOwnGroup(currentName, currentAssignment?.excludeGroupIds ?? [], groupNames, 'exclude', naming),
     sourceGroups: [],
     legacyExcludeGroup: null,
     searchTypes: [],
@@ -350,15 +366,7 @@ export function planVersionMigration({ legacyPolicy, currentPolicy, legacyAssign
   const sourceGroups = legacyIncludeIds.map(id => ({ id, name: groupNames?.get(id.toLowerCase()) ?? null }));
   const broad = legacyAssignment.allDevices || legacyAssignment.allUsers;
   const allDedicated = sourceGroups.length > 0 && sourceGroups.every(g => g.name && isDedicatedGroup(g.name, legacyName));
-
-  if (!broad && allDedicated) {
-    return {
-      ...base,
-      strategy: 'move',
-      sourceGroups,
-      reason: 'The old version is assigned through its own group, so members are moved from that group to the new version\'s include group.',
-    };
-  }
+  const how = 'moved members are added to its exclude group and to the new version\'s pilot group';
 
   const searchTypes = [
     ...(legacyAssignment.allDevices ? ['device'] : []),
@@ -371,9 +379,181 @@ export function planVersionMigration({ legacyPolicy, currentPolicy, legacyAssign
     searchTypes,
     legacyExcludeGroup: findOwnGroup(legacyName, legacyAssignment.excludeGroupIds ?? [], groupNames, 'exclude', naming),
     reason: broad
-      ? `The old version is assigned to ${[legacyAssignment.allDevices && 'All devices', legacyAssignment.allUsers && 'All users'].filter(Boolean).join(' and ')}, so moved members are added to its exclude group and to the new version's include group.`
-      : 'The old version is assigned to groups shared with other policies. Those groups are left alone: moved members are added to the old version\'s exclude group and the new version\'s include group.',
+      ? `The old version is assigned to ${[legacyAssignment.allDevices && 'All devices', legacyAssignment.allUsers && 'All users'].filter(Boolean).join(' and ')}, so ${how}.`
+      : allDedicated
+        ? `The old version is assigned through its own group: ${how}. Its include group is left as it is.`
+        : `The old version is assigned to groups shared with other policies. Those groups are left alone: ${how}.`,
   };
+}
+
+// ── Finishing a migration ──────────────────────────────────────────────────
+
+const targetType = (target) => String(target?.['@odata.type'] ?? '').toLowerCase();
+const isBuiltInTarget = (target) => /alldevices|alllicensedusers/.test(targetType(target));
+const isExclusionTarget = (target) => targetType(target).includes('exclusiongroup');
+const isIncludeGroupTarget = (target) => targetType(target).includes('groupassignmenttarget') && !isExclusionTarget(target);
+
+// Built-in groups a summarizeAssignments() result includes.
+export const builtInsOf = (summary) =>
+  [summary?.allDevices && 'allDevices', summary?.allUsers && 'allUsers'].filter(Boolean);
+
+// The built-in group(s) the new version gets in the All devices model: what
+// the old version had, or the new version's D/U scope.
+export function finishBuiltIns(legacyAssignment, currentName) {
+  const kinds = builtInsOf(legacyAssignment);
+  return kinds.length > 0 ? kinds : [builtInFor('byScope', currentName)];
+}
+
+// Same model as the old version had, where the policy type allows it.
+export function defaultFinishModel(legacyAssignment, currentEndpoint) {
+  if (!supportsBuiltInTargets(currentEndpoint)) return 'groups';
+  return builtInsOf(legacyAssignment).length > 0 ? 'builtIn' : 'groups';
+}
+
+// Drop All devices / All users from an assignment list, keeping the rest.
+export function withoutBuiltIns(assignments = []) {
+  return assignments.filter(a => !isBuiltInTarget(a?.target)).map(toAssignInput);
+}
+
+/**
+ * What finishing a migration does to the new version. The old version loses
+ * all its assignments in both models.
+ *
+ * - 'builtIn': the new version is assigned to All devices / All users and
+ *   keeps its other targets, except its pilot group, which All devices
+ *   makes redundant; the caller empties that group.
+ * - 'groups': the new version ends up on its include group. The pilot group
+ *   is renamed to it ('rename'), or, when an include group already exists,
+ *   its members join that one and the pilot group is unassigned and emptied
+ *   ('merge'). Everyone still on the old version's own include groups joins
+ *   too, as does everyone the old version reached through All devices / All
+ *   users (`audience`, listed by the caller). Shared include groups are
+ *   handed over as they are.
+ *
+ * In both models the old version's exclusions carry over, except its own
+ * exclude group: during a migration that holds the devices already moved.
+ *
+ * @param plan  from planVersionMigration
+ * @param legacyAssignments / currentAssignments  raw assignments from Graph
+ * @param legacyAssignment  summarizeAssignments(legacyAssignments)
+ * @param groupNames  Map<lowercased groupId, name|null>
+ * @param existingIncludeGroupId  a directory group with the include group's
+ *   name that isn't assigned to the new version yet, if any
+ */
+export function planFinishMigration({
+  model, plan, legacyAssignments = [], currentAssignments = [], legacyAssignment, groupNames, existingIncludeGroupId = null,
+}) {
+  const nameOfGroup = (id) => groupNames?.get(String(id).toLowerCase()) ?? null;
+  const ownLegacyGroup = (id) => {
+    if (id && plan.legacyExcludeGroup?.id && id.toLowerCase() === plan.legacyExcludeGroup.id.toLowerCase()) return true;
+    const name = nameOfGroup(id);
+    return !!name && isDedicatedGroup(name, plan.legacyName);
+  };
+  const legacyTargets = legacyAssignments.map(a => a?.target).filter(Boolean);
+  const carriedExclusions = legacyTargets.filter(t => isExclusionTarget(t) && !ownLegacyGroup(t.groupId));
+  const excludedGroupIds = legacyTargets.filter(isExclusionTarget).map(t => t.groupId);
+  // The old version's own include/exclude groups: emptied once it's unassigned.
+  // Shared groups are never touched.
+  const ownLegacyGroupIds = [...new Set(legacyTargets
+    .filter(t => t.groupId && !isBuiltInTarget(t) && ownLegacyGroup(t.groupId))
+    .map(t => t.groupId))];
+
+  if (model === 'builtIn') {
+    const builtIns = finishBuiltIns(legacyAssignment, plan.currentName);
+    const pilotId = String(plan.currentPilotGroup?.id ?? '').toLowerCase();
+    const kept = currentAssignments.filter(a =>
+      !(pilotId && isIncludeGroupTarget(a?.target) && String(a.target.groupId).toLowerCase() === pilotId));
+    const { assignments } = mergeAssignmentTargets(kept, [...builtIns.map(builtInTarget), ...carriedExclusions]);
+    return {
+      model,
+      builtIns,
+      assignments,
+      pilotGroupId: plan.currentPilotGroup?.id ?? null,
+      ownLegacyGroupIds,
+      removesPilotGroup: kept.length < currentAssignments.length,
+      carriedExclusions: carriedExclusions.length,
+      // The old version only reached groups, so All devices/users is wider.
+      widensScope: builtInsOf(legacyAssignment).length === 0,
+    };
+  }
+
+  const ownIncludeGroupIds = legacyTargets.filter(t => isIncludeGroupTarget(t) && ownLegacyGroup(t.groupId)).map(t => t.groupId);
+  const sharedIncludes = legacyTargets.filter(t => isIncludeGroupTarget(t) && !ownLegacyGroup(t.groupId));
+
+  const pilotGroupId = plan.currentPilotGroup?.id ?? null;
+  const includeGroupId = plan.currentIncludeGroup?.id ?? existingIncludeGroupId ?? null;
+  const sameGroup = !!pilotGroupId && !!includeGroupId && pilotGroupId.toLowerCase() === includeGroupId.toLowerCase();
+  // rename: the pilot group becomes the include group
+  // merge:  pilot members join the existing include group; the pilot group is unassigned and emptied
+  // create: no pilot group, so the include group is created (or reused)
+  // use:    the include group exists and there's no separate pilot group
+  const includeAction = includeGroupId
+    ? (pilotGroupId && !sameGroup ? 'merge' : 'use')
+    : (pilotGroupId ? 'rename' : 'create');
+
+  return {
+    model,
+    includeAction,
+    includeGroupId,
+    includeName: plan.currentIncludeGroup?.name ?? null,
+    pilotGroupId,
+    includeAssigned: !!plan.currentIncludeGroup?.id,
+    ownLegacyGroupIds,
+    ownIncludeGroupIds,
+    excludedGroupIds,
+    audience: builtInsOf(legacyAssignment).map(kind => (kind === 'allUsers' ? 'user' : 'device')),
+    handOver: [...sharedIncludes, ...carriedExclusions],
+    sharedIncludes: sharedIncludes.length,
+    carriedExclusions: carriedExclusions.length,
+  };
+}
+
+// ── Platforms (for listing "All devices" as group members) ─────────────────
+
+/**
+ * Platform of a tenant policy ({ displayName, policy: raw } or the raw
+ * object): 'windows' | 'macos' | 'ios' | 'android' | 'linux' | null.
+ */
+export function policyPlatform(policy) {
+  const raw = policy?.policy ?? policy ?? {};
+  const fromText = (text) => {
+    const value = String(text ?? '').toLowerCase();
+    if (!value) return null;
+    if (value.includes('macos')) return 'macos';
+    if (/\bios\b|ios[a-z]/.test(value)) return 'ios';
+    if (value.includes('android') || value.includes('aosp')) return 'android';
+    if (value.includes('linux')) return 'linux';
+    if (value.includes('windows') || value.includes('win32')) return 'windows';
+    return null;
+  };
+  const fromPlatforms = fromText(raw.platforms);
+  if (fromPlatforms) return fromPlatforms;
+  const fromType = fromText(raw['@odata.type']);
+  if (fromType) return fromType;
+  const name = policyDisplayName(policy?.displayName ?? raw.displayName ?? raw.name).toLowerCase();
+  if (/^(win|w365)\b/.test(name)) return 'windows';
+  if (/^macos\b/.test(name)) return 'macos';
+  if (/^(ios|ipados)\b/.test(name)) return 'ios';
+  if (/^android\b/.test(name)) return 'android';
+  return null;
+}
+
+export const PLATFORM_LABELS = Object.freeze({
+  windows: 'Windows', macos: 'macOS', ios: 'iOS/iPadOS', android: 'Android', linux: 'Linux',
+});
+
+// Whether an Entra device's operatingSystem belongs to a platform. Unknown
+// platforms match every device.
+export function deviceMatchesPlatform(operatingSystem, platform) {
+  const os = String(operatingSystem ?? '').toLowerCase();
+  switch (platform) {
+    case 'windows': return os.startsWith('windows');
+    case 'macos': return os.startsWith('mac');
+    case 'ios': return /^(ios|ipados|iphone|ipad)/.test(os);
+    case 'android': return os.startsWith('android');
+    case 'linux': return os.startsWith('linux') || os.startsWith('ubuntu') || os.startsWith('rhel');
+    default: return true;
+  }
 }
 
 /**

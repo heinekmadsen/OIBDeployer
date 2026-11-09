@@ -5535,6 +5535,47 @@ p, h1, h2, h3, h4, h5, h6 {
   font-size: 0.8125rem;
 }
 
+.mig-models {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+.mig-model {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.375rem;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.mig-model input { margin-top: 0.2rem; }
+
+.mig-model > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.mig-model--on {
+  border-color: var(--brand-blue);
+  box-shadow: 0 0 0 1px var(--brand-blue);
+}
+
+.mig-model--off {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.mig-model-warn { color: #b45309; }
+[data-theme="dark"] .mig-model-warn { color: #fbbf24; }
+
 .mig-log-group {
   display: flex;
   flex-direction: column;
