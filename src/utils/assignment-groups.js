@@ -54,6 +54,8 @@ export function buildGroupName(policyName, kind, naming = DEFAULT_GROUP_NAMING) 
     include: naming.includeLabel,
     exclude: naming.excludeLabel,
     pilot: naming.pilotLabel || DEFAULT_GROUP_NAMING.pilotLabel,
+    // Old version's filter while a filter pilot runs: everyone but the pilot devices.
+    heldBack: 'Not piloted',
   };
   const label = String(labels[kind] ?? naming.includeLabel ?? '').trim();
   const base = policyDisplayName(policyName);
@@ -175,8 +177,11 @@ export function groupKindsFor(options) {
  * What a deployed policy is assigned to.
  *
  * @param policy  { displayName, endpoint }
- * @param options { target, include, exclude }
- * @returns { builtIn: 'allDevices'|'allUsers'|null, groups: ['include'|'exclude'], skipped: string|null }
+ * @param options { target, include, exclude, filters }
+ *   filters: { [policyPlatform()]: { id, mode, name } } — the assignment
+ *   filter put on the include target (built-in group or include group) of
+ *   policies of that platform. Exclusion targets can't have filters.
+ * @returns { builtIn: 'allDevices'|'allUsers'|null, groups: ['include'|'exclude'], filter, skipped: string|null }
  *   skipped explains why nothing is assigned (the policy type can't use the
  *   chosen built-in group).
  */
@@ -187,10 +192,15 @@ export function planPolicyAssignment(policy, options) {
     return {
       builtIn: null,
       groups: [],
+      filter: null,
       skipped: `Intune can't assign this policy type to ${builtInLabel(builtIn)}, so it was left unassigned. Assign it to a group in Intune.`,
     };
   }
-  return { builtIn, groups: groupKindsFor(normalised), skipped: null };
+  const groups = groupKindsFor(normalised);
+  const hasIncludeTarget = !!builtIn || groups.includes('include');
+  const chosen = options?.filters?.[policyPlatform(policy)];
+  const filter = hasIncludeTarget && chosen?.id ? { id: chosen.id, mode: chosen.mode === 'exclude' ? 'exclude' : 'include', name: chosen.name ?? null } : null;
+  return { builtIn, groups, filter, skipped: null };
 }
 
 export function targetKey(target) {
@@ -388,7 +398,9 @@ export function planVersionMigration({ legacyPolicy, currentPolicy, legacyAssign
 
 // ── Finishing a migration ──────────────────────────────────────────────────
 
-const targetType = (target) => String(target?.['@odata.type'] ?? '').toLowerCase();
+function targetType(target) {
+  return String(target?.['@odata.type'] ?? '').toLowerCase();
+}
 const isBuiltInTarget = (target) => /alldevices|alllicensedusers/.test(targetType(target));
 const isExclusionTarget = (target) => targetType(target).includes('exclusiongroup');
 const isIncludeGroupTarget = (target) => targetType(target).includes('groupassignmenttarget') && !isExclusionTarget(target);
@@ -442,6 +454,7 @@ export function withoutBuiltIns(assignments = []) {
  */
 export function planFinishMigration({
   model, plan, legacyAssignments = [], currentAssignments = [], legacyAssignment, groupNames, existingIncludeGroupId = null,
+  filterPilot = null,
 }) {
   const nameOfGroup = (id) => groupNames?.get(String(id).toLowerCase()) ?? null;
   const ownLegacyGroup = (id) => {
@@ -460,17 +473,41 @@ export function planFinishMigration({
 
   if (model === 'builtIn') {
     const builtIns = finishBuiltIns(legacyAssignment, plan.currentName);
-    const pilotId = String(plan.currentPilotGroup?.id ?? '').toLowerCase();
-    const kept = currentAssignments.filter(a =>
-      !(pilotId && isIncludeGroupTarget(a?.target) && String(a.target.groupId).toLowerCase() === pilotId));
-    const { assignments } = mergeAssignmentTargets(kept, [...builtIns.map(builtInTarget), ...carriedExclusions]);
+    const lower = (id) => String(id ?? '').toLowerCase();
+    const pilotId = lower(plan.currentPilotGroup?.id);
+    const pilotFilterId = lower(filterPilot?.pilotFilter?.id);
+    const helperFilterIds = new Set([pilotFilterId, lower(filterPilot?.heldBackFilter?.id)].filter(Boolean));
+    // The pilot group, and a built-in target filtered to the pilot devices,
+    // make way for the old version's built-in target.
+    const kept = currentAssignments.filter(a => {
+      const t = a?.target;
+      if (pilotId && isIncludeGroupTarget(t) && lower(t.groupId) === pilotId) return false;
+      if (pilotFilterId && isBuiltInTarget(t) && lower(targetFilter(t)?.id) === pilotFilterId) return false;
+      return true;
+    });
+    // The old version's built-in targets keep their filter. A filter pilot's
+    // helper filter is swapped back for the filter the old version had.
+    const legacyBuiltInTargets = legacyTargets.filter(isBuiltInTarget).map(t => {
+      const filter = targetFilter(t);
+      return filter && helperFilterIds.has(lower(filter.id)) ? withFilter(t, filterPilot.original) : { ...t };
+    });
+    const builtInTargets = legacyBuiltInTargets.length > 0 ? legacyBuiltInTargets : builtIns.map(builtInTarget);
+    const { assignments } = mergeAssignmentTargets(kept, [...builtInTargets, ...carriedExclusions]);
     return {
       model,
       builtIns,
+      // [{ kind, filter: { id, mode } | null }] for describing the result.
+      builtInFilters: builtInTargets.map(t => ({
+        kind: targetType(t).includes('alllicensedusers') ? 'allUsers' : 'allDevices',
+        filter: targetFilter(t),
+      })),
       assignments,
       pilotGroupId: plan.currentPilotGroup?.id ?? null,
+      // Helper filters of a filter pilot, deleted once nothing uses them.
+      helperFilterIds: [filterPilot?.pilotFilter?.id, filterPilot?.heldBackFilter?.id].filter(Boolean),
       ownLegacyGroupIds,
-      removesPilotGroup: kept.length < currentAssignments.length,
+      removesPilotGroup: !!pilotId && currentAssignments.some(a =>
+        isIncludeGroupTarget(a?.target) && lower(a.target.groupId) === pilotId),
       carriedExclusions: carriedExclusions.length,
       // The old version only reached groups, so All devices/users is wider.
       widensScope: builtInsOf(legacyAssignment).length === 0,
@@ -505,6 +542,174 @@ export function planFinishMigration({
     handOver: [...sharedIncludes, ...carriedExclusions],
     sharedIncludes: sharedIncludes.length,
     carriedExclusions: carriedExclusions.length,
+  };
+}
+
+// ── Assignment filters ─────────────────────────────────────────────────────
+
+const FILTER_ID = 'deviceAndAppManagementAssignmentFilterId';
+const FILTER_TYPE = 'deviceAndAppManagementAssignmentFilterType';
+const NO_FILTER_ID = '00000000-0000-0000-0000-000000000000';
+export const MAX_FILTER_RULE_LENGTH = 3072;
+
+// Filter platforms that fit a policyPlatform() value.
+export const FILTER_PLATFORMS = Object.freeze({
+  windows: ['windows10AndLater'],
+  macos: ['macOS'],
+  ios: ['iOS'],
+  android: ['androidForWork', 'androidWorkProfile', 'androidAOSP', 'android'],
+});
+
+// Device filters only: app filters ('apps') belong to app protection policies.
+export function filterFitsPlatform(filter, platform) {
+  if (!filter || filter.assignmentFilterManagementType === 'apps') return false;
+  return (FILTER_PLATFORMS[platform] ?? []).includes(filter.platform);
+}
+
+// The filter on an assignment target: { id, mode } or null.
+export function targetFilter(target) {
+  const id = target?.[FILTER_ID];
+  const mode = String(target?.[FILTER_TYPE] ?? '').toLowerCase();
+  if (!id || id === NO_FILTER_ID || mode === 'none') return null;
+  return { id, mode: mode === 'exclude' ? 'exclude' : 'include' };
+}
+
+// A copy of the target with this filter ({ id, mode }), or without any.
+export function withFilter(target, filter) {
+  const next = { ...target };
+  delete next[FILTER_ID];
+  delete next[FILTER_TYPE];
+  if (filter?.id) {
+    next[FILTER_ID] = filter.id;
+    next[FILTER_TYPE] = filter.mode === 'exclude' ? 'exclude' : 'include';
+  }
+  return next;
+}
+
+export const filterModeLabel = (mode) => (mode === 'exclude' ? 'exclude filter' : 'include filter');
+
+// ── Pilot through an assignment filter ─────────────────────────────────────
+//
+// The new version gets the old version's built-in target (All devices or All
+// users) with an include filter listing the pilot devices by name. The old
+// version keeps its target but stops reaching those devices: with the same
+// filter as an exclude filter when it had no filter, or with a "Not piloted"
+// filter combining its own filter with the device list. The original filter
+// is written into the helper filters' descriptions, so a migration can be
+// picked up again later and finished with the original filter.
+
+const quoteRuleValue = (value) => `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+
+export function deviceNameRule(names, operator = '-in') {
+  return `(device.deviceName ${operator} [${names.map(quoteRuleValue).join(', ')}])`;
+}
+
+// Device names in the last deviceName -in / -notIn list of a rule.
+export function parseDeviceNames(rule) {
+  const lists = [...String(rule ?? '').matchAll(/device\.deviceName\s+-(?:in|notIn)\s+\[([^\]]*)\]/gi)];
+  if (lists.length === 0) return [];
+  const body = lists[lists.length - 1][1];
+  return [...body.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(m => m[1].replace(/\\(.)/g, '$1'));
+}
+
+// The old version's filter while the pilot runs, built from its own filter.
+export function heldBackRule(original, names) {
+  if (original.mode === 'exclude') {
+    return { rule: `(${original.rule}) or ${deviceNameRule(names, '-in')}`, mode: 'exclude' };
+  }
+  return { rule: `(${original.rule}) and ${deviceNameRule(names, '-notIn')}`, mode: 'include' };
+}
+
+const ORIGINAL_FILTER_RE = /\[oib-original-filter:(?:none|([0-9a-f-]{36}):(include|exclude))\]/i;
+
+export function originalFilterMarker(original) {
+  return original?.id ? `[oib-original-filter:${original.id}:${original.mode}]` : '[oib-original-filter:none]';
+}
+
+// undefined: no marker; null: the old version had no filter; else { id, mode }.
+export function readOriginalFilter(description) {
+  const match = String(description ?? '').match(ORIGINAL_FILTER_RE);
+  if (!match) return undefined;
+  return match[1] ? { id: match[1], mode: match[2].toLowerCase() } : null;
+}
+
+const findFilterByName = (filters, name) =>
+  [...(filters?.values() ?? [])].find(f => normalise(f.displayName) === normalise(name)) ?? null;
+
+/**
+ * State of a pilot through an assignment filter.
+ *
+ * @param filters  Map<lowercased filterId, filter> with displayName, platform,
+ *                 rule and description
+ * @param platform policyPlatform() of the policies
+ * @returns {
+ *   available, reason,        // can a filter pilot be used here at all
+ *   kind,                      // 'allDevices' | 'allUsers' — the old version's built-in target
+ *   original,                  // { id, mode, name, rule, platform } | null — the old version's own filter
+ *   pilotFilter,               // { id|null, name } — filter of the new version during the pilot
+ *   heldBackFilter,            // { id|null, name } | null — the old version's filter during the pilot
+ *   names,                     // device names in the pilot
+ *   active,                    // the new version is assigned through the pilot filter
+ *   filterPlatform,            // platform for filters created by the pilot
+ * }
+ */
+export function planFilterPilot({ plan, legacyAssignments = [], currentAssignments = [], filters, platform, naming = DEFAULT_GROUP_NAMING }) {
+  const pilotName = buildGroupName(plan.currentName, 'pilot', naming);
+  const heldBackName = buildGroupName(plan.legacyName, 'heldBack', naming);
+  const base = {
+    available: false, reason: null, kind: null, original: null, names: [], active: false,
+    pilotFilter: { id: null, name: pilotName }, heldBackFilter: null, filterPlatform: null,
+  };
+
+  const legacyBuiltIns = legacyAssignments.map(a => a?.target).filter(t => t && isBuiltInTarget(t));
+  if (legacyBuiltIns.length !== 1) {
+    return { ...base, reason: legacyBuiltIns.length === 0
+      ? 'A filter pilot needs the old version to be assigned to All devices or All users.'
+      : 'A filter pilot needs the old version to be assigned to either All devices or All users, not both.' };
+  }
+  if (!FILTER_PLATFORMS[platform]) {
+    return { ...base, reason: 'Assignment filters aren\'t available for this policy\'s platform.' };
+  }
+
+  const legacyTarget = legacyBuiltIns[0];
+  const kind = targetType(legacyTarget).includes('alllicensedusers') ? 'allUsers' : 'allDevices';
+  const filterById = (id) => (id ? filters?.get(String(id).toLowerCase()) ?? null : null);
+  const describe = (f, mode) => (f ? { id: f.id, mode, name: f.displayName, rule: f.rule, platform: f.platform } : null);
+
+  // The pilot filter: by name, or the filter on the new version's built-in target.
+  const currentBuiltIn = currentAssignments.map(a => a?.target).find(t => t && isBuiltInTarget(t) &&
+    targetType(t) === targetType(legacyTarget));
+  const currentFilter = filterById(targetFilter(currentBuiltIn)?.id);
+  const pilot = findFilterByName(filters, pilotName)
+    ?? (currentFilter && readOriginalFilter(currentFilter.description) !== undefined ? currentFilter : null);
+
+  const legacyFilterRef = targetFilter(legacyTarget);
+  const legacyFilter = filterById(legacyFilterRef?.id);
+  let original;
+  let heldBack = null;
+  if (pilot && legacyFilter && legacyFilter.id.toLowerCase() === pilot.id.toLowerCase()) {
+    original = null; // the old version had no filter: it uses the pilot filter as an exclude filter
+  } else if (legacyFilter && readOriginalFilter(legacyFilter.description) !== undefined) {
+    const marker = readOriginalFilter(legacyFilter.description);
+    heldBack = { id: legacyFilter.id, name: legacyFilter.displayName };
+    original = marker ? describe(filterById(marker.id), marker.mode) ?? { ...marker, name: null, rule: null } : null;
+  } else {
+    original = legacyFilterRef ? describe(legacyFilter, legacyFilterRef.mode) ?? { ...legacyFilterRef, name: null, rule: null } : null;
+  }
+
+  // A pilot filter left behind by an earlier pilot (e.g. not deleted yet)
+  // doesn't make a running pilot: only one the new version is assigned with.
+  const active = !!pilot && !!currentFilter && currentFilter.id.toLowerCase() === pilot.id.toLowerCase();
+  return {
+    ...base,
+    available: true,
+    kind,
+    original,
+    pilotFilter: pilot ? { id: pilot.id, name: pilot.displayName } : base.pilotFilter,
+    heldBackFilter: heldBack ?? (original ? { id: null, name: heldBackName } : null),
+    names: active ? parseDeviceNames(pilot.rule) : [],
+    active,
+    filterPlatform: original?.platform ?? legacyFilter?.platform ?? FILTER_PLATFORMS[platform][0],
   };
 }
 

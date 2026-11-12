@@ -124,6 +124,7 @@ function App() {
         ...(saved.target ? { target: saved.target } : {}),
         ...(typeof saved.include === 'boolean' ? { include: saved.include } : {}),
         ...(typeof saved.exclude === 'boolean' ? { exclude: saved.exclude } : {}),
+        ...(saved.filters && typeof saved.filters === 'object' ? { filters: saved.filters } : {}),
       }));
     }
     if (resume.deploymentType === 'new' && resume.policyTypesSelection) {
@@ -140,12 +141,14 @@ function App() {
   }, [isAuthenticated, isLoadingReleaseManifest, releasePlatforms]);
 
   // Assignment made right after deployment: new include/exclude groups, or
-  // All devices / All users with an optional exclude group.
+  // All devices / All users with an optional exclude group, and optionally an
+  // assignment filter per platform ({ windows: { id, mode, name } }).
   const [groupOptions, setGroupOptions] = useState(() => ({
     enabled: false,
     target: 'group',
     include: true,
     exclude: true,
+    filters: {},
     naming: loadGroupNaming(),
   }));
   const [groupAccess, setGroupAccess] = useState(null);
@@ -165,7 +168,12 @@ function App() {
         ? { policyTypes: selectedPolicyTypes, osTypes: selectedOSTypes, tenantLicensing, usingDefenderAV }
         : null,
       enableGroups: true,
-      groupSettings: { target: groupOptions.target, include: groupOptions.include, exclude: groupOptions.exclude },
+      groupSettings: {
+        target: groupOptions.target,
+        include: groupOptions.include,
+        exclude: groupOptions.exclude,
+        filters: groupOptions.filters,
+      },
     });
     try {
       await authService.requestAdditionalScopes(CONFIG.msal.groupManageScopes);

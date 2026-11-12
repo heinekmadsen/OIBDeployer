@@ -1,8 +1,12 @@
 import React, { useState } from 'react';
 import {
   ArrowLeft, ShieldCheck, ShieldAlert, AlertTriangle,
-  ChevronDown, ChevronRight, Loader, RefreshCw, CheckCircle, Download
+  ChevronDown, ChevronRight, Loader, RefreshCw, CheckCircle, Download, Users
 } from 'lucide-react';
+import graphAPI from '../utils/graph-api';
+import { summarizeAssignments } from '../utils/device-validation';
+import { collectGroupIds, groupLabel } from '../utils/policy-status';
+import PolicyAssignmentStatus from './PolicyAssignmentStatus';
 
 /**
  * ValidationDashboard
@@ -37,6 +41,60 @@ const ValidationDashboard = ({
   const [expanded, setExpanded] = useState(new Set());
   const [expandedSection, setExpandedSection] = useState({}); // policyName+section → bool
 
+  // Assignments (incl. assignment filters) of the matched tenant policies,
+  // loaded on demand.
+  const [assignmentsById, setAssignmentsById] = useState(null);
+  const [assignmentFilters, setAssignmentFilters] = useState(null);
+  const [groupNames, setGroupNames] = useState(null);
+  const [isLoadingAssignments, setIsLoadingAssignments] = useState(false);
+  const [assignmentsError, setAssignmentsError] = useState(null);
+  const tenantPolicies = matchedPolicies.map(p => p.existingPolicy).filter(Boolean);
+
+  const loadAssignments = async () => {
+    setIsLoadingAssignments(true);
+    setAssignmentsError(null);
+    try {
+      const [raw, filters] = await Promise.all([
+        graphAPI.getAssignmentsForPolicies(tenantPolicies),
+        graphAPI.getAssignmentFilters().catch(() => null),
+      ]);
+      const summaries = new Map();
+      raw.forEach((value, id) => summaries.set(id, Array.isArray(value) ? summarizeAssignments(value) : value));
+      setAssignmentsById(summaries);
+      setAssignmentFilters(filters);
+      // Group names need GroupMember.Read.All; without it groups show as IDs.
+      const groupIds = collectGroupIds([...summaries.values()]);
+      if (groupIds.length > 0) {
+        setGroupNames(await graphAPI.getGroupNames(groupIds).catch(() => null));
+      }
+    } catch (error) {
+      setAssignmentsError(error.message);
+    } finally {
+      setIsLoadingAssignments(false);
+    }
+  };
+
+  // "All devices (include filter: Corp)" for the CSV.
+  const assignmentText = (policy) => {
+    const summary = policy.existingPolicy && assignmentsById?.get(policy.existingPolicy.id);
+    if (!summary) return '';
+    if (summary.error) return `Couldn't read: ${summary.error}`;
+    if (!summary.hasIncludes) return 'Not assigned';
+    const filterOf = (key) => {
+      const f = summary.filters.find(x => x.target === key);
+      if (!f) return '';
+      const name = assignmentFilters?.get(f.id.toLowerCase())?.displayName || f.id;
+      return ` (${f.mode} filter: ${name})`;
+    };
+    const parts = [
+      summary.allDevices && `All devices${filterOf('All devices')}`,
+      summary.allUsers && `All users${filterOf('All users')}`,
+      ...summary.includeGroupIds.map(id => `${groupLabel(id, groupNames)}${filterOf(id)}`),
+    ].filter(Boolean);
+    const excluded = summary.excludeGroupIds.map(id => groupLabel(id, groupNames));
+    return parts.join('; ') + (excluded.length ? ` | excluded: ${excluded.join('; ')}` : '');
+  };
+
   // Settings Catalog (including Settings-Catalog-format Endpoint Security) and
   // Compliance policies are supported. Admin Templates / legacy intents / device
   // configuration etc. are out of scope for now.
@@ -68,6 +126,7 @@ const ValidationDashboard = ({
         osType: policy.osType || '',
         policyType: policy.policyType || policy.type || '',
         matchedPolicy: policy.existingPolicy?.displayName || policy.existingPolicy?.name || '',
+        assignedTo: assignmentText(policy),
       };
 
       if (result.status === 'error') {
@@ -115,11 +174,12 @@ const ValidationDashboard = ({
   };
 
   const handleExportCsv = () => {
-    const headers = ['Policy Name', 'OS', 'Policy Type', 'Matched Tenant Policy', 'Deviation Type', 'Setting', 'OIB Value', 'Tenant Value'];
+    // "Assigned To" is filled in once assignments have been loaded.
+    const headers = ['Policy Name', 'OS', 'Policy Type', 'Matched Tenant Policy', 'Assigned To', 'Deviation Type', 'Setting', 'OIB Value', 'Tenant Value'];
     const csvContent = [
       headers.join(','),
       ...exportRows.map(r => [
-        r.policyName, r.osType, r.policyType, r.matchedPolicy, r.deviationType, r.setting, r.oibValue, r.tenantValue
+        r.policyName, r.osType, r.policyType, r.matchedPolicy, r.assignedTo, r.deviationType, r.setting, r.oibValue, r.tenantValue
       ].map(csvEscape).join(','))
     ].join('\r\n');
 
@@ -283,6 +343,14 @@ const ValidationDashboard = ({
               </span>
             )}
           </div>
+          {assignmentsById && policy.existingPolicy && (
+            <PolicyAssignmentStatus
+              tenantPolicy={policy.existingPolicy}
+              assignment={assignmentsById.get(policy.existingPolicy.id)}
+              groupNames={groupNames}
+              filters={assignmentFilters}
+            />
+          )}
         </div>
 
         <div className="policy-actions">
@@ -416,6 +484,28 @@ const ValidationDashboard = ({
             </div>
           )}
         </div>
+
+        {/* Assignments, incl. assignment filters */}
+        {tenantPolicies.length > 0 && (
+          <div className="assignment-status-bar">
+            <div className="assignment-status-main">
+              <Users size={18} />
+              <span>
+                {assignmentsById
+                  ? 'Each policy shows who it is assigned to, including assignment filters.'
+                  : 'See who each matched policy is assigned to, including assignment filters.'}
+              </span>
+              <button className="btn btn-secondary btn-small" onClick={loadAssignments} disabled={isLoadingAssignments}>
+                {isLoadingAssignments
+                  ? <><Loader size={14} className="spinning" /> Loading…</>
+                  : assignmentsById ? <><RefreshCw size={14} /> Refresh assignments</> : 'Load assignments'}
+              </button>
+            </div>
+            {assignmentsError && (
+              <div className="assignment-status-note"><AlertTriangle size={14} /> {assignmentsError}</div>
+            )}
+          </div>
+        )}
 
         {/* Summary Stats */}
         {validatedCount > 0 && (

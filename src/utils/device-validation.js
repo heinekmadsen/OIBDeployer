@@ -19,6 +19,8 @@ export const DEVICE_STATUS = {
   unassigned:    { label: 'No assignments in tenant',    badge: 'missing',  row: 'missing',   severity: 6 },
   succeeded:     { label: 'Applied',                     badge: 'current',  row: 'compliant', severity: 7 },
   notApplicable: { label: 'Not applicable',              badge: 'neutral',  row: '',          severity: 8 },
+  // Assigned, but the assignment filter(s) keep this device out by design.
+  filteredOut:   { label: 'Filtered out',                badge: 'neutral',  row: '',          severity: 8.5 },
   notInTenant:   { label: 'Not deployed in tenant',      badge: 'neutral',  row: 'missing',   severity: 9 },
   notReportable: { label: 'No per-device report',        badge: 'neutral',  row: '',          severity: 10 },
 };
@@ -63,6 +65,7 @@ export const summarizeAssignments = (assignments = []) => {
     summary.groups > 0 && `${summary.groups} group${summary.groups > 1 ? 's' : ''}`,
   ].filter(Boolean);
   summary.label = (parts.join(', ') || 'Nothing') +
+    (summary.filters.length ? ` with ${summary.filters.length} assignment filter${summary.filters.length > 1 ? 's' : ''}` : '') +
     (summary.exclusions ? ` (${summary.exclusions} excluded group${summary.exclusions > 1 ? 's' : ''})` : '');
   return summary;
 };
@@ -193,9 +196,11 @@ const isNotReportable = (tenantPolicy) =>
  * @param {Map} [assignmentsById]  tenant policy id → summarizeAssignments()
  *                                 result (or { error }) for policies the
  *                                 device didn't report
+ * @param {Map} [filterEvalsById]  tenant policy id → getFilterEvaluation()
+ *                                 result for assigned policies with filters
  * @returns {{ items, otherPolicies, totals }}
  */
-export const buildDeviceValidation = (comparisonData, deviceStatus, osTypes, assignmentsById = null) => {
+export const buildDeviceValidation = (comparisonData, deviceStatus, osTypes, assignmentsById = null, filterEvalsById = null) => {
   const configIndex = indexConfigurationRows(deviceStatus.configurationRows || []);
   const complianceIndex = indexComplianceStates(deviceStatus.complianceStates || []);
   const claimedConfigIds = new Set();
@@ -243,7 +248,10 @@ export const buildDeviceValidation = (comparisonData, deviceStatus, osTypes, ass
         }
       }
 
-      items.push({ policy, osType, tenantPolicy: policy.existingPolicy, report, status, assignments });
+      const filterEvaluation = filterEvalsById?.get(policy.existingPolicy?.id) ?? null;
+      if (status === 'notReported' && isFilteredOut(assignments, filterEvaluation)) status = 'filteredOut';
+
+      items.push({ policy, osType, tenantPolicy: policy.existingPolicy, report, status, assignments, filterEvaluation });
     });
 
     // Ambiguous tenant matches: report whichever copy reached the device.
@@ -291,6 +299,40 @@ export const buildDeviceValidation = (comparisonData, deviceStatus, osTypes, ass
 
   return { items, otherPolicies, totals };
 };
+
+// Whether a filter keeps the device out: an include filter that didn't match,
+// or an exclude filter that did.
+export const filterExcludes = (evaluation) =>
+  (evaluation?.mode === 'exclude' && evaluation.result === 'match') ||
+  (evaluation?.mode !== 'exclude' && evaluation?.result === 'notmatch');
+
+/**
+ * A policy is filtered out for a device when every include target has an
+ * assignment filter and Intune evaluated each of those filters as keeping
+ * the device out. An include target without a filter (a group the device
+ * may simply not be in) leaves the question open.
+ */
+export const isFilteredOut = (assignments, evaluations) => {
+  if (!assignments?.hasIncludes || !Array.isArray(evaluations) || evaluations.length === 0) return false;
+  const includeTargets = [
+    assignments.allDevices && 'All devices',
+    assignments.allUsers && 'All users',
+    ...(assignments.includeGroupIds || []),
+  ].filter(Boolean);
+  return includeTargets.every(target => {
+    const filter = (assignments.filters || []).find(f => f.target === target);
+    if (!filter) return false;
+    const evaluation = evaluations.find(e => String(e.filterId).toLowerCase() === String(filter.id).toLowerCase());
+    return !!evaluation && filterExcludes({ ...evaluation, mode: evaluation.mode || filter.mode });
+  });
+};
+
+// Assigned policies the device didn't report, whose filters are worth
+// asking Intune about.
+export const getPoliciesNeedingFilterEvaluation = (validation) =>
+  (validation?.items || [])
+    .filter(item => item.status === 'notReported' && item.assignments?.filters?.length > 0 && item.tenantPolicy?.id)
+    .map(item => ({ policy: item.tenantPolicy, filterIds: [...new Set(item.assignments.filters.map(f => f.id))] }));
 
 // Tenant policies the device didn't report on, whose assignments are worth
 // fetching to tell "unassigned" apart from "assigned but not reported".

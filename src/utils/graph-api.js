@@ -9,7 +9,8 @@ import {
     groupTarget,
     mergeAssignmentTargets,
     normaliseDirectoryObject,
-    planPolicyAssignment
+    planPolicyAssignment,
+    withFilter
 } from './assignment-groups.js';
 
 class GraphAPI {
@@ -1740,13 +1741,85 @@ class GraphAPI {
         return result;
     }
 
-    // Assignment filters (id → { displayName, platform }) for labelling.
+    // Assignment filters, Map<lowercased id, filter> with displayName,
+    // platform, rule, description and management type.
     async getAssignmentFilters() {
         const items = await this.getAllPagesScoped(
             CONFIG.msal.scopes,
-            '/deviceManagement/assignmentFilters?$select=id,displayName,platform'
+            '/deviceManagement/assignmentFilters?$select=id,displayName,platform,rule,description,assignmentFilterManagementType'
         );
         return new Map(items.map(f => [f.id.toLowerCase(), f]));
+    }
+
+    async createAssignmentFilter({ displayName, description, platform, rule }) {
+        return this.makeScopedRequest(CONFIG.msal.scopes, '/deviceManagement/assignmentFilters', 'POST', {
+            '@odata.type': '#microsoft.graph.deviceAndAppManagementAssignmentFilter',
+            displayName,
+            description: String(description ?? '').slice(0, 1024),
+            platform,
+            rule,
+            assignmentFilterManagementType: 'devices',
+            roleScopeTags: ['0']
+        });
+    }
+
+    async updateAssignmentFilterRule(filterId, rule) {
+        await this.makeScopedRequest(
+            CONFIG.msal.scopes,
+            `/deviceManagement/assignmentFilters/${encodeURIComponent(filterId)}`,
+            'PATCH',
+            { '@odata.type': '#microsoft.graph.deviceAndAppManagementAssignmentFilter', rule }
+        );
+    }
+
+    // Intune refuses to delete a filter it still sees as assigned (error 5001)
+    // for a little while after its last assignment was removed, so retry.
+    async deleteAssignmentFilter(filterId, { retries = 6, retryDelay = 5000 } = {}) {
+        for (let attempt = 1; ; attempt++) {
+            try {
+                await this.makeScopedRequest(
+                    CONFIG.msal.scopes,
+                    `/deviceManagement/assignmentFilters/${encodeURIComponent(filterId)}`,
+                    'DELETE'
+                );
+                return;
+            } catch (error) {
+                const stillAssigned = error.status === 400 && /5001|associated with existing assignments/i.test(error.message);
+                if (!stillAssigned || attempt >= retries) throw error;
+                await this.sleep(retryDelay);
+            }
+        }
+    }
+
+    /**
+     * How Intune evaluated assignment filters for a device and policy at its
+     * last check-in (beta). Returns [{ filterId, name, mode, result }] where
+     * result is 'match' | 'notMatch' | other values Intune reports.
+     */
+    async getFilterEvaluation({ managedDeviceId, payloadId, userId = null, filterIds = [] }) {
+        const result = await this.makeScopedRequest(
+            CONFIG.msal.scopes,
+            '/deviceManagement/getAssignmentFiltersStatusDetails',
+            'POST',
+            {
+                managedDeviceId,
+                payloadId,
+                ...(userId ? { userId } : {}),
+                assignmentFilterIds: filterIds,
+                top: 50,
+                skip: 0
+            }
+        );
+        // The property is spelled "evalutionSummaries" in Graph.
+        const details = result?.value ?? result ?? {};
+        const summaries = details.evalutionSummaries ?? details.evaluationSummaries ?? [];
+        return summaries.map(s => ({
+            filterId: s.assignmentFilterId,
+            name: s.assignmentFilterDisplayName,
+            mode: String(s.assignmentFilterType ?? '').toLowerCase(),
+            result: String(s.evaluationResult ?? '').toLowerCase(),
+            evaluatedAt: s.evaluationDateTime ?? null
+        }));
     }
 
     /**
@@ -2033,7 +2106,7 @@ class GraphAPI {
      */
     async ensureAssignmentGroupsForPolicy(policy, options) {
         const plan = planPolicyAssignment(policy, options);
-        const outcome = { added: 0, builtIn: plan.builtIn };
+        const outcome = { added: 0, builtIn: plan.builtIn, filter: plan.filter };
         if (plan.skipped) {
             outcome.skipped = plan.skipped;
             return outcome;
@@ -2046,9 +2119,12 @@ class GraphAPI {
                     `${kind === 'include' ? 'Include' : 'Exclude'} group for the Intune policy "${policy.displayName}". Created by OIB Deployer.`
                 );
             }
+            // The filter goes on the include target; exclusions can't have one.
             const targets = [
-                ...(plan.builtIn ? [builtInTarget(plan.builtIn)] : []),
-                ...plan.groups.map(kind => groupTarget(outcome[kind].id, kind)),
+                ...(plan.builtIn ? [withFilter(builtInTarget(plan.builtIn), plan.filter)] : []),
+                ...plan.groups.map(kind => (kind === 'include'
+                    ? withFilter(groupTarget(outcome[kind].id, kind), plan.filter)
+                    : groupTarget(outcome[kind].id, kind))),
             ];
             // Retrying only helps while new groups replicate to Intune.
             const { added } = await this.addAssignmentTargets(policy, targets, { retries: plan.groups.length > 0 ? 3 : 1 });

@@ -9,8 +9,12 @@ import { CONFIG } from '../utils/config';
 import { saveConsentResume } from '../utils/consent-resume';
 import {
   DEVICE_STATUS, ISSUE_STATUSES, buildDeviceValidation, getOIBOSTypesForDevice,
-  getPoliciesNeedingAssignments, summarizeAssignments
+  getPoliciesNeedingAssignments, summarizeAssignments, getPoliciesNeedingFilterEvaluation, filterExcludes
 } from '../utils/device-validation';
+
+// "include filter "Corp" didn't match" / "exclude filter "Kiosk" matched"
+const describeEvaluation = (e) =>
+  `${e.mode === 'exclude' ? 'exclude' : 'include'} filter "${e.name || e.filterId}" ${e.result === 'match' ? 'matched' : e.result === 'notmatch' ? "didn't match" : `returned "${e.result}"`}`;
 
 
 const formatDate = (value) => {
@@ -83,6 +87,30 @@ const fetchAssignments = async (tenantPolicies) => {
   return result;
 };
 
+// Filter evaluations per policy for one device. Failures are left out, so
+// the policy just stays "Assigned – not reported".
+const fetchFilterEvaluations = async (entries, device) => {
+  const result = new Map();
+  const queue = [...entries];
+  const worker = async () => {
+    while (queue.length) {
+      const { policy, filterIds } = queue.shift();
+      try {
+        result.set(policy.id, await graphAPI.getFilterEvaluation({
+          managedDeviceId: device.id,
+          payloadId: policy.id,
+          userId: device.userId || null,
+          filterIds,
+        }));
+      } catch (err) {
+        console.warn(`Filter evaluation for ${policy.id} failed:`, err.message);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, queue.length) }, worker));
+  return result;
+};
+
 /**
  * DeviceValidationDashboard
  *
@@ -109,6 +137,7 @@ const DeviceValidationDashboard = ({
   const [selectedDevice, setSelectedDevice] = useState(null);
   const [deviceStatus, setDeviceStatus] = useState(null);
   const [assignmentsById, setAssignmentsById] = useState(null);
+  const [filterEvalsById, setFilterEvalsById] = useState(null);
   const [isChecking, setIsChecking] = useState(false);
   const [error, setError] = useState(null);
   const [needsConsent, setNeedsConsent] = useState(false);
@@ -144,6 +173,7 @@ const DeviceValidationDashboard = ({
     setSelectedDevice(device);
     setDeviceStatus(null);
     setAssignmentsById(null);
+    setFilterEvalsById(null);
     setIsChecking(true);
     setError(null);
     setFilter('all');
@@ -158,8 +188,16 @@ const DeviceValidationDashboard = ({
       const preliminary = buildDeviceValidation(comparisonData, status, osTypes);
       const assignments = await fetchAssignments(getPoliciesNeedingAssignments(preliminary));
 
+      // Assigned but not reported, with an assignment filter: ask Intune how
+      // the filter was evaluated for this device at its last check-in.
+      const withAssignments = buildDeviceValidation(comparisonData, status, osTypes, assignments);
+      const filterEvals = await fetchFilterEvaluations(
+        getPoliciesNeedingFilterEvaluation(withAssignments), currentDevice
+      );
+
       setDeviceStatus(status);
       setAssignmentsById(assignments);
+      setFilterEvalsById(filterEvals);
       setSelectedDevice(currentDevice);
     } catch (err) {
       handleError(err);
@@ -182,10 +220,10 @@ const DeviceValidationDashboard = ({
 
   const validation = useMemo(() => {
     if (!deviceStatus || !comparisonData) return null;
-    return buildDeviceValidation(comparisonData, deviceStatus, applicableOSTypes, assignmentsById);
+    return buildDeviceValidation(comparisonData, deviceStatus, applicableOSTypes, assignmentsById, filterEvalsById);
     // applicableOSTypes is derived from selectedDevice + selectedOSTypes
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deviceStatus, comparisonData, selectedDevice, selectedOSTypes, assignmentsById]);
+  }, [deviceStatus, comparisonData, selectedDevice, selectedOSTypes, assignmentsById, filterEvalsById]);
 
   const filteredItems = (validation?.items || []).filter(item => matchesFilter(item, filter));
 
@@ -406,9 +444,21 @@ const DeviceValidationDashboard = ({
               <span className="validation-score">Last reported {formatDate(lastReported)}</span>
             )}
           </div>
+          {item.status === 'filteredOut' && (
+            <div className="device-item-hint">
+              {`Assigned to ${item.assignments.label}, but at its last check-in the `}
+              {item.filterEvaluation.filter(filterExcludes).map(describeEvaluation).join(' and the ')}
+              {', so this device is left out on purpose.'}
+            </div>
+          )}
           {item.status === 'notReported' && (
             <div className="device-item-hint">
               {`Assigned to ${item.assignments.label}. `}
+              {item.assignments.filters?.length > 0
+                ? (item.filterEvaluation?.length > 0
+                  ? `Filter evaluation at the last check-in: ${item.filterEvaluation.map(describeEvaluation).join('; ')}. `
+                  : "The assignment uses a filter that Intune hasn't evaluated for this device yet. ")
+                : ''}
               {item.assignments.allDevices || item.assignments.allUsers
                 ? 'This device should receive it — sync the device, and check it again if the policy was assigned recently.'
                 : "The device (or its user) may not be in the assigned groups, or hasn't checked in since the policy was assigned."}

@@ -5183,6 +5183,19 @@ p, h1, h2, h3, h4, h5, h6 {
 
 .group-options-target > span {
   font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.group-options-target > span.pas-muted {
+  font-weight: 400;
+}
+
+.group-options-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
 }
 
 .group-options-target select {
@@ -5533,6 +5546,21 @@ p, h1, h2, h3, h4, h5, h6 {
   flex-direction: column;
   gap: 0.25rem;
   font-size: 0.8125rem;
+}
+
+.mig-pilot-mode {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.375rem;
+}
+
+.mig-pilot-mode label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  cursor: pointer;
 }
 
 .mig-models {

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowRight, ArrowLeft, X, Loader, AlertTriangle, KeyRound, Users, Monitor, User,
-  Search, CheckCircle, GitMerge, Info
+  Search, CheckCircle, GitMerge, Info, Filter
 } from 'lucide-react';
 import graphAPI from '../utils/graph-api';
 import { CONFIG } from '../utils/config';
@@ -10,10 +10,19 @@ import { groupLabel } from '../utils/policy-status';
 import {
   planVersionMigration, planFinishMigration, groupTarget, loadGroupNaming, builtInsOf, builtInLabel, isDedicatedGroup,
   mergeAssignmentTargets,
-  defaultFinishModel, supportsBuiltInTargets, withoutBuiltIns, policyPlatform, PLATFORM_LABELS
+  defaultFinishModel, supportsBuiltInTargets, withoutBuiltIns, policyPlatform, PLATFORM_LABELS,
+  planFilterPilot, targetFilter, withFilter, builtInTarget, deviceNameRule, heldBackRule, originalFilterMarker,
+  MAX_FILTER_RULE_LENGTH, filterModeLabel
 } from '../utils/assignment-groups';
 
 const builtInList = (kinds) => kinds.map(builtInLabel).join(' and ');
+
+const isBuiltInTarget = (target) => /alldevices|alllicensedusers/i.test(target?.['@odata.type'] ?? '');
+const builtInKindOf = (target) => (/alllicensedusers/i.test(target?.['@odata.type'] ?? '') ? 'allUsers' : 'allDevices');
+const lower = (value) => String(value ?? '').toLowerCase();
+
+const filterName = (filters, id) => filters?.get(lower(id))?.displayName || `filter ${String(id).slice(0, 8)}…`;
+const describeFilter = (filters, filter) => (filter ? `${filterModeLabel(filter.mode)}: ${filterName(filters, filter.id)}` : '');
 
 const nameOf = (policy) => policy?.displayName || policy?.name || '';
 
@@ -23,12 +32,17 @@ const MemberIcon = ({ type }) => {
   return <Users size={13} />;
 };
 
-const describeAssignment = (summary, groupNames) => {
+const describeAssignment = (summary, groupNames, filters) => {
   if (!summary?.hasIncludes) return 'Not assigned';
+  // summarizeAssignments records which target each filter sits on.
+  const withFilterOf = (label, key = label) => {
+    const filter = (summary.filters || []).find(f => f.target === key);
+    return filter ? `${label} (${describeFilter(filters, filter)})` : label;
+  };
   const parts = [
-    summary.allDevices && 'All devices',
-    summary.allUsers && 'All users',
-    ...summary.includeGroupIds.map(id => groupLabel(id, groupNames)),
+    summary.allDevices && withFilterOf('All devices'),
+    summary.allUsers && withFilterOf('All users'),
+    ...summary.includeGroupIds.map(id => withFilterOf(groupLabel(id, groupNames), id)),
   ].filter(Boolean);
   const excluded = summary.excludeGroupIds.map(id => groupLabel(id, groupNames));
   return parts.join(', ') + (excluded.length ? ` — excluded: ${excluded.join(', ')}` : '');
@@ -128,6 +142,18 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
       ]);
       const existingInclude = includeMatches.find(g => g.securityEnabled) || includeMatches[0] || null;
 
+      // Assignment filters: for describing assignments and for a pilot
+      // through a filter.
+      const filters = await graphAPI.getAssignmentFilters().catch(() => new Map());
+      const filterPilot = planFilterPilot({
+        plan,
+        legacyAssignments: legacyRaw,
+        currentAssignments: currentRaw,
+        filters,
+        platform: policyPlatform(currentPolicy),
+        naming,
+      });
+
       // A member can sit in several of the old version's groups.
       const sourceById = new Map();
       sourceLists.flat().forEach(member => {
@@ -150,6 +176,8 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
         existingIncludeGroup: existingInclude
           ? { id: existingInclude.id, dynamic: (existingInclude.groupTypes || []).includes('DynamicMembership') }
           : null,
+        filters,
+        filterPilot,
       });
       setSelectedOld(new Set());
       setSelectedNew(new Set());
@@ -162,24 +190,51 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
   useEffect(() => { load(); }, [load]);
 
   const { plan } = data;
-  const movedIds = useMemo(() => new Set((data.movedMembers || []).map(m => m.id)), [data.movedMembers]);
+  const fp = data.filterPilot;
 
-  // The new version is already on All devices/users: it reaches everyone, so
-  // piloting is impossible and everyone the old version reaches gets both.
-  const currentBuiltIns = builtInsOf(data.currentAssignment);
+  // Pilot through a group (pilot group + the old version's exclude group) or
+  // through an assignment filter (device names). A running pilot decides;
+  // otherwise the user picks, defaulting to a filter when the old version
+  // already uses one.
+  const [pilotModeChoice, setPilotModeChoice] = useState(null);
+  const groupPilotStarted = (data.movedMembers?.length ?? 0) > 0;
+  const canChoosePilotMode = !!fp?.available && !fp.active && !groupPilotStarted;
+  const pilotMode = fp?.active ? 'filter'
+    : groupPilotStarted || !fp?.available ? 'group'
+      : (pilotModeChoice ?? (fp.original ? 'filter' : 'group'));
+  const filterMode = pilotMode === 'filter';
+
+  // Pilot devices: pilot group members, or the device names in the pilot filter.
+  const pilotMembers = useMemo(() => (filterMode
+    ? (fp?.names ?? []).map(name => ({ id: `name:${name}`, name, type: 'device', detail: '' }))
+    : (data.movedMembers || [])), [filterMode, fp, data.movedMembers]);
+  const movedIds = useMemo(() => new Set((data.movedMembers || []).map(m => m.id)), [data.movedMembers]);
+  const pilotNames = useMemo(() => new Set((fp?.names ?? []).map(lower)), [fp]);
+
+  // The new version is already on All devices/users (not through the pilot
+  // filter): it reaches everyone, so piloting is impossible and everyone the
+  // old version reaches gets both.
+  const currentBuiltIns = [...new Set((data.currentRaw || [])
+    .map(a => a?.target)
+    .filter(t => t && isBuiltInTarget(t) && !(fp?.pilotFilter?.id && lower(targetFilter(t)?.id) === lower(fp.pilotFilter.id)))
+    .map(builtInKindOf))];
   const coversAll = !!plan && plan.strategy !== 'none' && currentBuiltIns.length > 0;
   const builtInAllowed = supportsBuiltInTargets(currentPolicy?.endpoint);
+  const searchTypes = filterMode ? ['device'] : (plan?.searchTypes ?? []);
 
   // Members still on the old version: its group members (minus moved or
-  // excluded ones), plus search hits when it targets All devices/users.
+  // excluded ones), plus search hits when it targets All devices/users. In a
+  // filter pilot, devices already in the pilot filter are left out by name.
   const remaining = useMemo(() => {
     const byId = new Map();
-    [...(data.sourceMembers || []), ...(searchResults || [])].forEach(member => {
-      if (movedIds.has(member.id) || data.excludedIds?.has(member.id)) return;
+    [...(filterMode ? [] : (data.sourceMembers || [])), ...(searchResults || [])].forEach(member => {
+      if (filterMode) {
+        if (!member.name || pilotNames.has(lower(member.name))) return;
+      } else if (movedIds.has(member.id) || data.excludedIds?.has(member.id)) return;
       if (!byId.has(member.id)) byId.set(member.id, member);
     });
     return [...byId.values()];
-  }, [data.sourceMembers, data.excludedIds, searchResults, movedIds]);
+  }, [filterMode, pilotNames, data.sourceMembers, data.excludedIds, searchResults, movedIds]);
 
   const matchesFilter = (member) => {
     const q = filter.trim().toLowerCase();
@@ -265,13 +320,131 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
     }
   };
 
-  const moveSelected = () => run('Moving…', () =>
-    doMove(remaining.filter(m => selectedOld.has(m.id))));
+  // ── Pilot through an assignment filter ───────────────────────────────────
+
+  const ruleTooLong = (rule) => rule.length > MAX_FILTER_RULE_LENGTH;
+
+  // Point a policy's built-in target at a filter ({ id, mode } or null).
+  const setBuiltInFilter = async (policy, filter) => {
+    const fresh = await graphAPI.getAssignmentsFor(policy);
+    const index = fresh.findIndex(a => isBuiltInTarget(a?.target));
+    if (index < 0) throw new Error(`"${nameOf(policy)}" is no longer assigned to All devices or All users.`);
+    const now = targetFilter(fresh[index].target);
+    if (lower(now?.id) === lower(filter?.id) && (now?.mode ?? null) === (filter?.mode ?? null)) return false;
+    await graphAPI.setAssignmentsFor(policy, fresh.map((a, i) => ({
+      target: i === index ? withFilter(a.target, filter) : { ...a.target },
+    })));
+    return true;
+  };
+
+  // Intune can take a little while to let go of a filter that was just
+  // unassigned; deleteAssignmentFilter retries meanwhile.
+  const deleteHelperFilters = async (ids) => {
+    if (ids.filter(Boolean).length > 0) setBusy('Cleaning up filters…');
+    for (const id of ids.filter(Boolean)) {
+      try {
+        await graphAPI.deleteAssignmentFilter(id);
+        addLog('ok', `Deleted the migration filter "${filterName(data.filters, id)}".`);
+      } catch (error) {
+        addLog('error', `Couldn't delete the filter "${filterName(data.filters, id)}" (delete it in Intune later): ${error.message.slice(0, 160)}`);
+      }
+    }
+  };
+
+  // Set the pilot to exactly these device names. Moving adds to the new
+  // version first; moving back restores the old version first.
+  const setPilotNames = async (names, adding) => {
+    const original = fp.original;
+    if (original && !original.rule) throw new Error('The old version\'s assignment filter couldn\'t be read, so it can\'t be combined with the pilot.');
+
+    if (names.length === 0) {
+      // Nobody left in the pilot: put both versions back as they were.
+      const restored = await setBuiltInFilter(legacyPolicy, original ? { id: original.id, mode: original.mode } : null);
+      if (restored) addLog('ok', `"${plan.legacyName}" is back on ${original ? `its filter "${original.name}"` : 'All devices without a filter'}.`);
+      const fresh = await graphAPI.getAssignmentsFor(currentPolicy);
+      await graphAPI.setAssignmentsFor(currentPolicy, fresh
+        .filter(a => !(isBuiltInTarget(a?.target) && lower(targetFilter(a.target)?.id) === lower(fp.pilotFilter.id)))
+        .map(a => ({ target: { ...a.target } })));
+      addLog('ok', `Removed the pilot from "${plan.currentName}".`);
+      await deleteHelperFilters([fp.pilotFilter.id, fp.heldBackFilter?.id]);
+      return;
+    }
+
+    const pilotRule = deviceNameRule(names);
+    const held = original ? heldBackRule(original, names) : null;
+    if (ruleTooLong(pilotRule) || (held && ruleTooLong(held.rule))) {
+      throw new Error(`That's more devices than fit in one filter rule (${MAX_FILTER_RULE_LENGTH} characters). Finish the migration, or move fewer devices.`);
+    }
+
+    let pilotId = fp.pilotFilter.id;
+    const updateNew = async () => {
+      if (!pilotId) {
+        const created = await graphAPI.createAssignmentFilter({
+          displayName: fp.pilotFilter.name,
+          description: `Pilot devices for "${plan.currentName}" during a version migration. Created by OIB Deployer. ${originalFilterMarker(original)}`,
+          platform: fp.filterPlatform,
+          rule: pilotRule,
+        });
+        pilotId = created.id;
+        addLog('ok', `Created the pilot filter "${fp.pilotFilter.name}".`);
+      } else {
+        await graphAPI.updateAssignmentFilterRule(pilotId, pilotRule);
+        addLog('ok', `Updated the pilot filter "${fp.pilotFilter.name}": ${names.length} device(s).`);
+      }
+      if (!fp.active) {
+        const fresh = await graphAPI.getAssignmentsFor(currentPolicy);
+        const target = withFilter(builtInTarget(fp.kind), { id: pilotId, mode: 'include' });
+        await graphAPI.setAssignmentsFor(currentPolicy, [...fresh.map(a => ({ target: { ...a.target } })), { target }]);
+        addLog('ok', `Assigned "${plan.currentName}" to ${builtInLabel(fp.kind)} with the pilot filter.`);
+      }
+    };
+    const updateOld = async () => {
+      let filter = { id: pilotId, mode: 'exclude' };
+      if (original) {
+        let heldId = fp.heldBackFilter.id;
+        if (!heldId) {
+          const created = await graphAPI.createAssignmentFilter({
+            displayName: fp.heldBackFilter.name,
+            description: `Everyone "${plan.legacyName}" reached through "${original.name}", except the devices piloting "${plan.currentName}". Created by OIB Deployer. ${originalFilterMarker(original)}`,
+            platform: original.platform || fp.filterPlatform,
+            rule: held.rule,
+          });
+          heldId = created.id;
+          addLog('ok', `Created "${fp.heldBackFilter.name}" for the old version.`);
+        } else {
+          await graphAPI.updateAssignmentFilterRule(heldId, held.rule);
+        }
+        filter = { id: heldId, mode: held.mode };
+      }
+      if (await setBuiltInFilter(legacyPolicy, filter)) {
+        addLog('ok', `"${plan.legacyName}" no longer reaches the pilot devices.`);
+      }
+    };
+
+    if (adding) { await updateNew(); await updateOld(); } else { await updateOld(); await updateNew(); }
+  };
+
+  const moveSelectedByFilter = () => run('Moving…', async () => {
+    const add = remaining.filter(m => selectedOld.has(m.id)).map(m => m.name).filter(Boolean);
+    await setPilotNames([...new Set([...fp.names, ...add])], true);
+    addLog('ok', `Moved ${add.length} device(s) to the new version.`);
+  });
+
+  const moveBackByFilter = () => run('Moving back…', async () => {
+    const back = new Set(pilotMembers.filter(m => selectedNew.has(m.id)).map(m => lower(m.name)));
+    await setPilotNames(fp.names.filter(name => !back.has(lower(name))), false);
+    addLog('ok', `Moved ${back.size} device(s) back to the old version.`);
+  });
+
+  const moveSelected = () => (filterMode ? moveSelectedByFilter() : run('Moving…', () =>
+    doMove(remaining.filter(m => selectedOld.has(m.id)))));
 
   // Old version first, then new. A member the old version wouldn't reach
   // (not in any of its groups, e.g. moved before exclusions were used) goes
   // back into the old version's own group, or stays on the new version.
-  const moveBack = () => run('Moving back…', async () => {
+  const moveBack = () => (filterMode ? moveBackByFilter() : moveBackByGroup());
+
+  const moveBackByGroup = () => run('Moving back…', async () => {
     const ids = [...selectedNew];
     const broad = data.legacyAssignment?.allDevices || data.legacyAssignment?.allUsers;
     const inOldGroups = new Set((data.sourceMembers || []).map(m => m.id));
@@ -303,10 +476,14 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
     legacyAssignment: data.legacyAssignment,
     groupNames: data.groupNames,
     existingIncludeGroupId: data.existingIncludeGroup?.id ?? null,
+    filterPilot: fp?.active ? fp : null,
   });
 
+  // A running filter pilot can only end on All devices / All users.
+  const groupsModelAllowed = !coversAll && !fp?.active;
+
   const openFinish = () => {
-    setFinishModel(coversAll ? 'builtIn' : defaultFinishModel(data.legacyAssignment, currentPolicy?.endpoint));
+    setFinishModel(coversAll || fp?.active ? 'builtIn' : defaultFinishModel(data.legacyAssignment, currentPolicy?.endpoint));
     setConfirmPilot(false);
     setConfirmFinish(true);
   };
@@ -439,7 +616,8 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
     const carried = heldBack.length > 0 ? [await carryExclusions(heldBack)] : [];
     if (fin.model === 'builtIn') {
       await graphAPI.setAssignmentsFor(currentPolicy, mergeAssignmentTargets(fin.assignments, carried).assignments);
-      addLog('ok', `Assigned "${plan.currentName}" to ${builtInList(fin.builtIns)}.`);
+      addLog('ok', `Assigned "${plan.currentName}" to ${fin.builtInFilters
+        .map(b => `${builtInLabel(b.kind)}${b.filter ? ` (${describeFilter(data.filters, b.filter)})` : ''}`).join(' and ')}.`);
       if (fin.removesPilotGroup) {
         addLog('ok', `Removed the pilot group "${plan.currentPilotGroup.name}" from it.`);
       }
@@ -452,6 +630,8 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
     await graphAPI.setAssignmentsFor(legacyPolicy, []);
     addLog('ok', `Removed all assignments from "${plan.legacyName}". You can delete it in Intune when you're ready.`);
     await emptyOldGroups(fin.ownLegacyGroupIds);
+    // The pilot's helper filters aren't used by anything any more.
+    if (fin.helperFilterIds?.length > 0) await deleteHelperFilters(fin.helperFilterIds);
   });
 
   // Members already excluded from the old version only have the new one
@@ -483,7 +663,7 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
     if (!searchQuery.trim()) return;
     setSearching(true);
     try {
-      setSearchResults(await graphAPI.searchDirectory(searchQuery, plan.searchTypes));
+      setSearchResults(await graphAPI.searchDirectory(searchQuery, searchTypes));
     } catch (error) {
       addLog('error', `Search failed: ${error.message.slice(0, 200)}`);
     } finally {
@@ -516,7 +696,10 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
       groupsFin.audience.includes('device') && `every ${platformLabel ? `${platformLabel} ` : ''}device in Entra ID`,
       groupsFin.audience.includes('user') && 'every member user (guests are skipped)',
     ].filter(Boolean).join(' and ');
-    const chosenAllowed = finishModel === 'builtIn' ? builtInAllowed : finishModel === 'groups' && !coversAll;
+    const chosenAllowed = finishModel === 'builtIn' ? builtInAllowed : finishModel === 'groups' && groupsModelAllowed;
+    const builtInTitle = builtInFin.builtInFilters
+      .map(b => `${builtInLabel(b.kind)}${b.filter ? ` (${describeFilter(data.filters, b.filter)})` : ''}`)
+      .join(' and ');
 
     const modelOption = (value, title, disabled, body) => (
       <label className={`mig-model ${finishModel === value ? 'mig-model--on' : ''} ${disabled ? 'mig-model--off' : ''}`}>
@@ -542,15 +725,22 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
           <strong>Finish the migration</strong>
           <p>How should <em>{plan.currentName}</em> be assigned once the old version is removed?</p>
           <div className="mig-models" role="radiogroup" aria-label="Assignment after the migration">
-            {modelOption('builtIn', builtInList(builtInFin.builtIns), !builtInAllowed, builtInAllowed ? (
+            {modelOption('builtIn', builtInTitle, !builtInAllowed, builtInAllowed ? (
               <>
                 <span>
-                  Assigns it to {builtInList(builtInFin.builtIns)}
+                  Assigns it to {builtInTitle}
                   {builtInFin.removesPilotGroup && (
                     <> and removes the pilot group <code>{pilotName}</code> from it{pilotCount > 0 && `, taking its ${pilotCount} member(s) out`} (the empty group is kept)</>
                   )}
                   . New devices get it automatically.
                   {builtInFin.carriedExclusions > 0 && ` It takes over ${builtInFin.carriedExclusions} exclusion(s) from the old version.`}
+                  {builtInFin.helperFilterIds.length > 0 && (
+                    <> The pilot&apos;s filters{' '}
+                      {builtInFin.helperFilterIds.map((id, index) => (
+                        <React.Fragment key={id}>{index > 0 && ' and '}<code>{filterName(data.filters, id)}</code></React.Fragment>
+                      ))}
+                      {' '}are deleted once nothing uses them.</>
+                  )}
                 </span>
                 {builtInFin.widensScope && !coversAll && (
                   <span className="mig-model-warn">The old version was only assigned to groups, so this reaches more than it did.</span>
@@ -559,8 +749,10 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
             ) : (
               <span>Intune can&apos;t assign this policy type to All devices or All users.</span>
             ))}
-            {modelOption('groups', 'Include/exclude groups', coversAll, coversAll ? (
+            {modelOption('groups', 'Include/exclude groups', !groupsModelAllowed, coversAll ? (
               <span>The new version is on {builtInList(currentBuiltIns)}. Use &quot;Pilot instead&quot; first to switch it to groups.</span>
+            ) : fp?.active ? (
+              <span>The pilot runs through an assignment filter, so the migration finishes on {builtInLabel(fp.kind)}.</span>
             ) : (
               <>
                 <span>
@@ -638,13 +830,13 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
                 {pair.legacy.map(p => <option key={p.id} value={p.id}>{nameOf(p)}</option>)}
               </select>
             ) : <strong>{nameOf(legacyPolicy)}</strong>}
-            <span className="mig-assigned">Assigned to: {describeAssignment(data.legacyAssignment, data.groupNames)}</span>
+            <span className="mig-assigned">Assigned to: {describeAssignment(data.legacyAssignment, data.groupNames, data.filters)}</span>
           </div>
           <ArrowRight size={18} className="mig-arrow" />
           <div className="mig-version">
             <span className="pas-label">New version</span>
             <strong>{nameOf(currentPolicy)}</strong>
-            <span className="mig-assigned">Assigned to: {describeAssignment(data.currentAssignment, data.groupNames)}</span>
+            <span className="mig-assigned">Assigned to: {describeAssignment(data.currentAssignment, data.groupNames, data.filters)}</span>
           </div>
         </div>
 
@@ -686,16 +878,56 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
           </div>
         ) : (
           <div className="mig-plan">
-            <Info size={14} />
+            {filterMode ? <Filter size={14} /> : <Info size={14} />}
             <div>
-              <div>{plan.reason}</div>
-              {plan.strategy !== 'none' && (
-                <ul>
-                  <li>New version&apos;s pilot group: <code>{plan.currentPilotGroup.name}</code> ({groupStatus(plan.currentPilotGroup)})</li>
-                  {plan.strategy === 'exclude' && (
-                    <li>Old version's exclude group: <code>{plan.legacyExcludeGroup.name}</code> ({groupStatus(plan.legacyExcludeGroup)})</li>
+              {canChoosePilotMode && plan.strategy !== 'none' && (
+                <div className="mig-pilot-mode" role="radiogroup" aria-label="How to pilot">
+                  <span className="pas-label">Pilot through</span>
+                  <label>
+                    <input type="radio" name="pilot-mode" checked={filterMode} disabled={!!busy}
+                      onChange={() => setPilotModeChoice('filter')} />
+                    an assignment filter (devices by name)
+                  </label>
+                  <label>
+                    <input type="radio" name="pilot-mode" checked={!filterMode} disabled={!!busy}
+                      onChange={() => setPilotModeChoice('group')} />
+                    a pilot group
+                  </label>
+                </div>
+              )}
+              {filterMode ? (
+                <>
+                  <div>
+                    The old version is assigned to {builtInLabel(fp.kind)}
+                    {fp.original ? ` with the ${describeFilter(data.filters, fp.original)}` : ' without a filter'}.
+                    Pilot devices are listed by name in a filter: the new version gets {builtInLabel(fp.kind)} with it as an
+                    include filter, and the old version{fp.original
+                      ? <> uses a copy of its own filter without those devices instead of <code>{fp.original.name}</code></>
+                      : ' gets the same filter as an exclude filter'}.
+                    Filters are evaluated at check-in, so no group membership is involved.
+                  </div>
+                  <ul>
+                    <li>Pilot filter: <code>{fp.pilotFilter.name}</code> ({groupStatus(fp.pilotFilter)})</li>
+                    {fp.heldBackFilter && (
+                      <li>Old version&apos;s filter while piloting: <code>{fp.heldBackFilter.name}</code> ({groupStatus(fp.heldBackFilter)})</li>
+                    )}
+                  </ul>
+                </>
+              ) : (
+                <>
+                  <div>{plan.reason}</div>
+                  {plan.strategy !== 'none' && (
+                    <ul>
+                      <li>New version&apos;s pilot group: <code>{plan.currentPilotGroup.name}</code> ({groupStatus(plan.currentPilotGroup)})</li>
+                      {plan.strategy === 'exclude' && (
+                        <li>Old version's exclude group: <code>{plan.legacyExcludeGroup.name}</code> ({groupStatus(plan.legacyExcludeGroup)})</li>
+                      )}
+                    </ul>
                   )}
-                </ul>
+                  {fp && !fp.available && fp.reason && plan.strategy !== 'none' && builtInsOf(data.legacyAssignment).length > 0 && (
+                    <div className="pas-muted">{fp.reason}</div>
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -707,17 +939,17 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
               <div className="mig-column-header">
                 <h4>Still on the old version ({remaining.length})</h4>
                 {/* With All devices/users there is no list to filter, only search. */}
-                {plan.sourceGroups.length > 0 && (
+                {plan.sourceGroups.length > 0 && !filterMode && (
                   <input type="search" placeholder="Filter…" value={filter} onChange={e => setFilter(e.target.value)} />
                 )}
               </div>
-              {plan.searchTypes.length > 0 && (
+              {searchTypes.length > 0 && (
                 <form className="mig-search" onSubmit={runSearch}>
                   <input
                     type="search"
                     value={searchQuery}
                     onChange={e => setSearchQuery(e.target.value)}
-                    placeholder={`Find ${plan.searchTypes.map(t => (t === 'device' ? 'devices' : 'users')).join(' or ')} by name…`}
+                    placeholder={`Find ${searchTypes.map(t => (t === 'device' ? 'devices' : 'users')).join(' or ')} by name…`}
                   />
                   <button type="submit" className="btn btn-secondary btn-small" disabled={searching || !searchQuery.trim()}>
                     {searching ? <Loader size={13} className="spinning" /> : <Search size={13} />} Search
@@ -727,8 +959,10 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
               <div className="mig-list">
                 {visibleRemaining.length === 0 && (
                   <div className="pas-muted mig-empty">
-                    {plan.searchTypes.length > 0 && !searchResults
-                      ? `The old version targets ${plan.searchTypes.includes('device') ? 'All devices' : 'All users'} — search to pick who moves first.`
+                    {searchTypes.length > 0 && !searchResults
+                      ? (filterMode
+                        ? 'Search for the devices to pilot first.'
+                        : `The old version targets ${searchTypes.includes('device') ? 'All devices' : 'All users'} — search to pick who moves first.`)
                       : 'Nothing left to move.'}
                   </div>
                 )}
@@ -747,11 +981,11 @@ const VersionMigrationModal = ({ pair, naming: namingProp, onClose, onGrantAcces
 
             <div className="mig-column">
               <div className="mig-column-header">
-                <h4>On the new version ({data.movedMembers.length})</h4>
+                <h4>On the new version ({pilotMembers.length})</h4>
               </div>
               <div className="mig-list">
-                {data.movedMembers.length === 0 && <div className="pas-muted mig-empty">No one has been moved yet.</div>}
-                {data.movedMembers.map(member => (
+                {pilotMembers.length === 0 && <div className="pas-muted mig-empty">No one has been moved yet.</div>}
+                {pilotMembers.map(member => (
                   <MemberRow key={member.id} member={member} checked={selectedNew.has(member.id)} onToggle={() => toggleNew(member.id)} />
                 ))}
               </div>

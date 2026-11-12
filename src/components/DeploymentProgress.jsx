@@ -1,6 +1,6 @@
 import React from 'react';
-import { CheckCircle, XCircle, Clock, Loader, RotateCcw, ArrowLeft, Users, Ban, AlertTriangle, Globe } from 'lucide-react';
-import { builtInLabel } from '../utils/assignment-groups';
+import { CheckCircle, XCircle, Clock, Loader, RotateCcw, ArrowLeft, Users, Ban, AlertTriangle, Globe, Filter } from 'lucide-react';
+import { builtInLabel, filterModeLabel } from '../utils/assignment-groups';
 
 const outcomeMessage = (groups) => {
   if (groups.added === 0) return 'The policy already had this assignment.';
@@ -43,6 +43,13 @@ const GroupOutcome = ({ groups }) => {
         )}
         {chip('include', groups.include)}
         {chip('exclude', groups.exclude)}
+        {groups.filter && (
+          <span className="pas-chip pas-chip-filter" title={groups.filter.id}>
+            <Filter size={12} />
+            <span className="pas-muted">{filterModeLabel(groups.filter.mode)}:</span>
+            {groups.filter.name || groups.filter.id}
+          </span>
+        )}
       </div>
       {groups.error ? (
         <div className="deployment-message error">

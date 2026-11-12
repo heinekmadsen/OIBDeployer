@@ -149,6 +149,8 @@ const Documentation = ({ onBack }) => {
               policy states, and lists each OIB policy as Applied, Error, Conflict, Pending, or Not deployed in the tenant. When the device has no
               report for a policy, the policy's assignments are read to tell "assigned, but not reported by the device yet" apart from "no assignments in the tenant".
               App Protection policies and Windows feature/quality/driver update profiles aren't reported per device by these APIs and are marked as such.
+              When an assigned policy uses an assignment filter, Intune is asked how the filter was evaluated for the device at its last check-in:
+              a policy whose filters leave the device out on purpose is shown as <em>Filtered out</em> rather than as a problem.
             </p>
           </div>
 
@@ -174,6 +176,12 @@ const Documentation = ({ onBack }) => {
                 <strong>All devices or All users by scope:</strong> OIB policies marked D (device) go to All devices and those marked U (user) to All users.
               </li>
             </ul>
+            <p>
+              With any of these you can also pick an existing <strong>assignment filter</strong> per platform (Windows, macOS, …) and whether it
+              includes or excludes the devices it matches. The filter goes on the include target, e.g. All devices with the include filter
+              &quot;Corporate Windows 11&quot;. Filters are evaluated at check-in, so they need no group processing; exclude groups can&apos;t have filters.
+              Create filters in Intune; the app only lists the ones that fit each policy&apos;s platform.
+            </p>
             <p>
               App protection policies and Windows feature, quality and driver update profiles can&apos;t be assigned to All devices or All users and are left
               unassigned with that option. Without any of these options, assign the policies yourself as per OIB guidance.
@@ -220,7 +228,27 @@ const Documentation = ({ onBack }) => {
                 If the new version is already assigned to All devices or All users, everyone gets both versions and there is nothing to pilot.
                 The dialog then offers to take the new version off All devices so you can pilot it, or to finish right away.
               </li>
+              <li>
+                <strong>Pilot through an assignment filter:</strong> when the old version is assigned to All devices or All users, with or without a
+                filter, you can pilot through a filter instead of a group. Pilot devices are listed by name in the filter
+                <em>{' {prefix}{policy name} - Pilot{suffix}'}</em>. The new version gets the same built-in target with that filter as an include filter;
+                the old version gets it as an exclude filter, or, if it already had a filter, a copy of that filter without the pilot devices
+                (<em>… - Not piloted</em>). Finishing gives the new version the old version&apos;s built-in target with its original filter and deletes the
+                pilot filters. One filter rule holds up to 3,072 characters, roughly 100 device names.
+              </li>
+              <li>
+                Finishing on All devices / All users always keeps the old version&apos;s assignment filter, so a filtered rollout stays filtered.
+              </li>
             </ul>
+          </div>
+
+          <div className="faq-item">
+            <h3>Where do I see assignment filters?</h3>
+            <p>
+              Existing Deployment&apos;s assignment overview, Policy Validation (&quot;Load assignments&quot;) and the migration dialog show each policy&apos;s
+              targets with their filters and whether they include or exclude. Policy Validation&apos;s CSV export has an &quot;Assigned To&quot; column once
+              assignments are loaded. Device Validation marks policies as <em>Filtered out</em> when Intune&apos;s filter evaluation leaves the device out.
+            </p>
           </div>
 
           <div className="faq-item">
