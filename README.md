@@ -16,10 +16,10 @@ Before running the application, you must create an Entra ID App Registration:
 2. Click **New registration**
 3. Configure the registration:
    - **Name**: `OIB Deployer` (or your preferred name)
-   - **Supported account types**: Accounts in this organizational directory only
-   - **Redirect URI**: 
-     - For local development: `http://localhost:5173`
-     - For GitHub Pages: `https://yourusername.github.io/your-repo-name` or your custom domain
+   - **Supported account types**: Accounts in this organizational directory only. Then also set `VITE_ENTRA_TENANT_ID` (see below): a single-tenant app can't sign in through the multi-tenant `/common` endpoint and Entra rejects it with `AADSTS50194`. Alternatively, choose *Accounts in any organizational directory* and leave the tenant ID unset.
+   - **Redirect URI**: platform **Single-page application**, with the exact address you open the app on:
+     - For local development: `http://localhost:5173` (no trailing slash)
+     - For self-hosting: the root of your site, e.g. `https://your-custom-domain.com`. The app is built for the root of a domain, so a sub-path such as `https://yourusername.github.io/your-repo-name` doesn't work.
 4. Click **Register**
 5. Note the **Application (client) ID** - you'll need this for configuration
 6. Under **API permissions**, add:
@@ -46,9 +46,10 @@ Create a `.env.local` file in the project root:
 
 ```env
 VITE_ENTRA_CLIENT_ID=your-app-registration-client-id-here
+VITE_ENTRA_TENANT_ID=your-tenant-id-here
 ```
 
-Replace `your-app-registration-client-id-here` with the Application (client) ID from your Entra ID App Registration.
+Replace `your-app-registration-client-id-here` with the Application (client) ID from your Entra ID App Registration, and `your-tenant-id-here` with the Directory (tenant) ID shown next to it (or a verified domain such as `contoso.onmicrosoft.com`). The tenant ID is required for a single-tenant app registration; leave the line out for a multi-tenant one. No quotes or spaces around the values.
 
 Optionally, also set:
 
@@ -64,7 +65,7 @@ VITE_GITHUB_TOKEN=your-github-personal-access-token
 npm run dev
 ```
 
-The application will be available at `http://localhost:5173`
+The application will be available at `http://localhost:5173`. Open it in a browser on the same machine: the dev server only listens on localhost, and Microsoft sign-in requires either `localhost` or HTTPS. Vite reads `.env.local` at startup, so restart `npm run dev` after changing it.
 
 ## Self-Hosting Setup (GitHub Pages)
 
@@ -81,15 +82,16 @@ In your forked repository:
 3. Add a new repository variable:
    - **Name**: `ENTRA_CLIENT_ID`
    - **Value**: Your Entra ID App Registration Application (client) ID
-4. (Optional) To avoid GitHub API rate limiting during production use, click the **Secrets** tab and add a new repository secret:
+4. For a single-tenant app registration, add another repository variable:
+   - **Name**: `ENTRA_TENANT_ID`
+   - **Value**: Your Directory (tenant) ID
+5. (Optional) To avoid GitHub API rate limiting during production use, click the **Secrets** tab and add a new repository secret:
    - **Name**: `GH_API_TOKEN`
    - **Value**: A [GitHub personal access token](https://github.com/settings/tokens) with the `public_repo` scope
 
 ### 3. Update Entra ID App Registration Redirect URI
 
-Update your Entra ID App Registration redirect URI to match your deployment URL:
-- GitHub Pages: `https://yourusername.github.io/repository-name`
-- Custom domain: `https://your-custom-domain.com`
+Add your deployment URL as a **Single-page application** redirect URI in the Entra ID App Registration, e.g. `https://your-custom-domain.com`. It must be the root of the domain (see Custom Domain below), not a `github.io/repository-name` sub-path.
 
 ### 4. Enable GitHub Pages
 
@@ -118,4 +120,5 @@ The built files will be in the `dist` directory.
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `VITE_ENTRA_CLIENT_ID` | Entra ID App Registration Application (client) ID | Yes |
+| `VITE_ENTRA_TENANT_ID` | Directory (tenant) ID or verified domain. Signs in through your tenant instead of `/common`; required for a single-tenant app registration | For single-tenant apps |
 | `VITE_GITHUB_TOKEN` | GitHub personal access token (`public_repo` scope), raises the GitHub API rate limit from 60 to 5000 requests/hour | No |

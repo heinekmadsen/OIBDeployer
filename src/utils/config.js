@@ -3,7 +3,12 @@ export const CONFIG = {
     // MSAL Configuration
     msal: {
         clientId: import.meta.env.VITE_ENTRA_CLIENT_ID, // Use environment variable for client ID
-        authority: 'https://login.microsoftonline.com/common', // Multi-tenant
+        // Multi-tenant app registrations sign in through /common. A single-tenant
+        // registration ("Accounts in this organizational directory only") must use
+        // its own tenant: set VITE_ENTRA_TENANT_ID to the tenant ID or a verified
+        // domain (e.g. contoso.onmicrosoft.com), otherwise Entra rejects the
+        // sign-in with AADSTS50194.
+        authority: `https://login.microsoftonline.com/${String(import.meta.env.VITE_ENTRA_TENANT_ID ?? '').trim() || 'common'}`,
         redirectUri: window.location.origin, // Dynamic redirect URI
         scopes: [
             'https://graph.microsoft.com/DeviceManagementConfiguration.ReadWrite.All'
