@@ -423,7 +423,15 @@ const DeviceValidationDashboard = ({
     return (
       <div key={key} className={`policy-comparison-item ${DEVICE_STATUS[item.status].row}`}>
         <div className="policy-info">
-          <div className="policy-name">{item.policy.name.replace('.json', '')}</div>
+          <div className="policy-name">
+            {item.policy.name.replace('.json', '')}
+            {item.policy.skuRequirements === 'Enterprise' && (
+              <span className="req-tag req-tag--enterprise" title="Requires Windows Enterprise SKU">Enterprise</span>
+            )}
+            {item.policy.licenseRequirements === 'MDE' && (
+              <span className="req-tag req-tag--mde" title="Requires Microsoft Defender for Endpoint licence">MDE</span>
+            )}
+          </div>
           {item.tenantPolicy && (
             <div className="matched-policy-name">
               <span className="matched-label">Tenant policy:</span>
