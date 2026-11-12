@@ -2839,6 +2839,25 @@ p, h1, h2, h3, h4, h5, h6 {
   margin-top: 0.5rem;
 }
 
+/* "Drift in 3 policies: 12 value mismatches · …" under the stat cards */
+.validation-summary-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  color: #9a3412;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: 0.5rem;
+  padding: 0.625rem 0.875rem;
+  font-size: 0.875rem;
+  margin: -1rem 0 1.5rem;
+}
+
+.validation-summary-line svg {
+  flex-shrink: 0;
+  margin-top: 0.125rem;
+}
+
 .policy-comparison-item.compliant {
   background: #f0fdf4;
 }
@@ -4474,6 +4493,11 @@ p, h1, h2, h3, h4, h5, h6 {
   background-color: #3d2e0a;
   border-color: #78350f;
   color: #fcd34d;
+}
+[data-theme="dark"] .validation-summary-line {
+  background-color: #2d1700;
+  border-color: #92400e;
+  color: #fdba74;
 }
 [data-theme="dark"] .validation-compliant-msg {
   background-color: #052e1a;

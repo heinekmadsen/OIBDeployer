@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import {
   ArrowLeft, ShieldCheck, ShieldAlert, AlertTriangle,
-  ChevronDown, ChevronRight, Loader, RefreshCw, CheckCircle, Download, Users
+  ChevronDown, ChevronRight, Loader, RefreshCw, CheckCircle, Download, Users, Clock
 } from 'lucide-react';
 import graphAPI from '../utils/graph-api';
 import { summarizeAssignments } from '../utils/device-validation';
@@ -40,6 +40,7 @@ const ValidationDashboard = ({
 }) => {
   const [expanded, setExpanded] = useState(new Set());
   const [expandedSection, setExpandedSection] = useState({}); // policyName+section → bool
+  const [filter, setFilter] = useState('all');
 
   // Assignments (incl. assignment filters) of the matched tenant policies,
   // loaded on demand.
@@ -108,10 +109,66 @@ const ValidationDashboard = ({
   );
   const unsupported = matchedPolicies.filter(p => !supported.includes(p));
 
-  const validatedCount   = supported.filter(p => validationResults.has(p.name)).length;
-  const compliantCount   = supported.filter(p => validationResults.get(p.name)?.status === 'compliant').length;
-  const driftedCount     = supported.filter(p => validationResults.get(p.name)?.status === 'drifted').length;
-  const errorCount       = supported.filter(p => validationResults.get(p.name)?.status === 'error').length;
+  const resultStatus = (policy) => validationResults.get(policy.name)?.status ?? null;
+  const assignmentOf = (policy) => policy.existingPolicy && assignmentsById?.get(policy.existingPolicy.id);
+
+  const matchesFilter = (policy, key) => {
+    const status = resultStatus(policy);
+    const assignment = assignmentOf(policy);
+    switch (key) {
+      case 'attention':    return status === 'drifted' || status === 'error';
+      case 'compliant':
+      case 'drifted':
+      case 'error':        return status === key;
+      case 'notValidated': return !status;
+      case 'outdated':
+      case 'newer':        return policy.status === key;
+      case 'requirements': return policy.skuRequirements === 'Enterprise' || policy.licenseRequirements === 'MDE';
+      case 'assigned':     return !!assignment && !assignment.error && assignment.hasIncludes;
+      case 'unassigned':   return !!assignment && !assignment.error && !assignment.hasIncludes;
+      default:             return true;
+    }
+  };
+
+  const countFor = (key) => supported.filter(p => matchesFilter(p, key)).length;
+
+  const compliantCount    = countFor('compliant');
+  const driftedCount      = countFor('drifted');
+  const errorCount        = countFor('error');
+  const notValidatedCount = countFor('notValidated');
+
+  // Optional tabs only show up when they have something in them (or are selected).
+  const filterTabs = [
+    { key: 'all',          label: 'All' },
+    { key: 'attention',    label: 'Needs attention' },
+    { key: 'compliant',    label: 'Compliant' },
+    { key: 'drifted',      label: 'Drift detected' },
+    { key: 'error',        label: 'Errors' },
+    { key: 'notValidated', label: 'Not validated' },
+    { key: 'outdated',     label: 'Update available', optional: true },
+    { key: 'newer',        label: 'Newer than OIB',   optional: true },
+    { key: 'requirements', label: 'Enterprise / MDE', optional: true },
+    ...(assignmentsById
+      ? [{ key: 'assigned', label: 'Assigned' }, { key: 'unassigned', label: 'Not assigned' }]
+      : []),
+  ]
+    .map(tab => ({ ...tab, count: countFor(tab.key) }))
+    .filter(tab => !tab.optional || tab.count > 0 || tab.key === filter);
+
+  const visiblePolicies = supported.filter(p => matchesFilter(p, filter));
+
+  // What the drift consists of, across every drifted policy.
+  const driftTotals = supported.reduce((acc, policy) => {
+    const result = validationResults.get(policy.name);
+    if (result?.status !== 'drifted') return acc;
+    acc.mismatches += result.mismatches?.length || 0;
+    acc.oibOnly += result.oibOnly?.length || 0;
+    acc.tenantOnly += result.tenantOnly?.length || 0;
+    if (policy.status === 'outdated') acc.outdated += 1;
+    return acc;
+  }, { mismatches: 0, oibOnly: 0, tenantOnly: 0, outdated: 0 });
+
+  const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`;
 
   // Flatten every deviation (mismatch, missing, extra, or error) across all
   // validated policies into CSV-ready rows — compliant policies contribute nothing.
@@ -516,37 +573,67 @@ const ValidationDashboard = ({
         )}
 
         {/* Summary Stats */}
-        {validatedCount > 0 && (
-          <div className="comparison-stats">
-            <div className="stat-card current">
-              <div className="stat-icon"><ShieldCheck size={24} /></div>
-              <div className="stat-content">
-                <div className="stat-number">{compliantCount}</div>
-                <div className="stat-label">Compliant</div>
+        {supported.length > 0 && (
+          <>
+            <div className="comparison-stats">
+              <div className="stat-card current">
+                <div className="stat-icon"><ShieldCheck size={24} /></div>
+                <div className="stat-content">
+                  <div className="stat-number">{compliantCount}</div>
+                  <div className="stat-label">Compliant</div>
+                </div>
+              </div>
+              <div className="stat-card outdated">
+                <div className="stat-icon"><ShieldAlert size={24} /></div>
+                <div className="stat-content">
+                  <div className="stat-number">{driftedCount}</div>
+                  <div className="stat-label">Drift detected</div>
+                </div>
+              </div>
+              <div className="stat-card error">
+                <div className="stat-icon"><AlertTriangle size={24} /></div>
+                <div className="stat-content">
+                  <div className="stat-number">{errorCount}</div>
+                  <div className="stat-label">Errors</div>
+                </div>
+              </div>
+              <div className="stat-card missing">
+                <div className="stat-icon"><Clock size={24} /></div>
+                <div className="stat-content">
+                  <div className="stat-number">{notValidatedCount}</div>
+                  <div className="stat-label">Not validated</div>
+                </div>
               </div>
             </div>
-            <div className="stat-card outdated">
-              <div className="stat-icon"><ShieldAlert size={24} /></div>
-              <div className="stat-content">
-                <div className="stat-number">{driftedCount}</div>
-                <div className="stat-label">Drift Detected</div>
+
+            {driftedCount > 0 && (
+              <div className="validation-summary-line">
+                <ShieldAlert size={16} className="icon-drift" />
+                <span>
+                  {`Drift in ${plural(driftedCount, 'policy', 'policies')}: `}
+                  {[
+                    plural(driftTotals.mismatches, 'value mismatch', 'value mismatches'),
+                    `${plural(driftTotals.oibOnly, 'OIB setting', 'OIB settings')} missing in the tenant`,
+                    `${plural(driftTotals.tenantOnly, 'extra setting', 'extra settings')} in the tenant`,
+                  ].join(' · ')}
+                  {'.'}
+                  {driftTotals.outdated > 0 && ` ${driftTotals.outdated} of them ${driftTotals.outdated === 1 ? 'has' : 'have'} an OIB update available, so some drift is expected until ${driftTotals.outdated === 1 ? "it's" : "they're"} updated.`}
+                </span>
               </div>
+            )}
+
+            <div className="filter-tabs">
+              {filterTabs.map(tab => (
+                <button
+                  key={tab.key}
+                  className={`filter-tab ${filter === tab.key ? 'active' : ''}`}
+                  onClick={() => setFilter(tab.key)}
+                >
+                  {`${tab.label} (${tab.count})`}
+                </button>
+              ))}
             </div>
-            <div className="stat-card missing">
-              <div className="stat-icon"><AlertTriangle size={24} /></div>
-              <div className="stat-content">
-                <div className="stat-number">{errorCount}</div>
-                <div className="stat-label">Errors</div>
-              </div>
-            </div>
-            <div className="stat-card newer">
-              <div className="stat-icon"><RefreshCw size={24} /></div>
-              <div className="stat-content">
-                <div className="stat-number">{validatedCount}/{supported.length}</div>
-                <div className="stat-label">Validated</div>
-              </div>
-            </div>
-          </div>
+          </>
         )}
 
         {/* Policy List - Grouped by OS and Policy Type */}
@@ -556,11 +643,16 @@ const ValidationDashboard = ({
               <AlertTriangle size={32} />
               <p>No matched Settings Catalog policies found. Run the comparison first.</p>
             </div>
+          ) : visiblePolicies.length === 0 ? (
+            <div className="empty-state">
+              <CheckCircle size={24} />
+              <p>No policies in this view.</p>
+            </div>
           ) : (
             (() => {
               // Group by OS, then by policy type (Compliance, Settings Catalog, etc.)
               const byOS = {};
-              supported.forEach(policy => {
+              visiblePolicies.forEach(policy => {
                 const osKey = policy.osType || 'Other';
                 if (!byOS[osKey]) byOS[osKey] = [];
                 byOS[osKey].push(policy);
