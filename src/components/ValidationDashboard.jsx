@@ -297,7 +297,15 @@ const ValidationDashboard = ({
     return (
       <div key={policy.name} className={`policy-comparison-item ${policy.status === 'outdated' || policy.status === 'newer' ? policy.status : ''} ${result ? result.status : ''}`}>
         <div className="policy-info">
-          <div className="policy-name">{policy.name.replace('.json', '')}</div>
+          <div className="policy-name">
+            {policy.name.replace('.json', '')}
+            {policy.skuRequirements === 'Enterprise' && (
+              <span className="req-tag req-tag--enterprise" title="Requires Windows Enterprise SKU">Enterprise</span>
+            )}
+            {policy.licenseRequirements === 'MDE' && (
+              <span className="req-tag req-tag--mde" title="Requires Microsoft Defender for Endpoint licence">MDE</span>
+            )}
+          </div>
           {policy.existingPolicy && (
             <div className="matched-policy-name">
               <span className="matched-label">Matched policy:</span>
